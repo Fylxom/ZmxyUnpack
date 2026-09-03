@@ -1,7 +1,14 @@
-# 是否保存 DEBUG 调试图片；False 时不产生 debug 图片
+# 是否保存 DEBUG 调试图片；正常运行建议关闭，以免大量写盘拖慢点击。
 DEBUG_SAVE_IMAGES = False
 
+# 是否输出搜索各阶段耗时。
+PRINT_SEARCH_BENCHMARK = True
+
+# 是否只截取棋盘区域。点击坐标仍使用屏幕绝对坐标。
+CAPTURE_BOARD_ONLY = True
+
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import keyboard
 import cv2
 import numpy as np
@@ -13,7 +20,9 @@ import time
 import random
 import threading
 import statistics
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import contextlib
+import io
 
 # 自动运行/搜索停止标志
 STOP_EVENT = threading.Event()
@@ -22,141 +31,310 @@ AUTO_STOP_REQUESTED = False
 SWAP_EVAL_CACHE = {}
 
 
-# ============================================================
-# 造梦西游5 棋盘识别 V5.12-fixed2-fixed
-#
-# 颜色面积识别
-#
-#   火 = f
-#   雷 = r
-#   风 = w
-#
-# 不使用：
-#
-#   模板匹配
-#   多尺度模板
-#   OCR
-#
-# 等级判断：
-#
-#   每一种颜色分别建立自己的面积阈值
-#
-# ============================================================
+# 颜色编码：火为 f、雷为 r、风为 w。
+# 识别主要依据颜色面积；连通区域和中心位置用于筛选候选区域，
+# 不使用模板匹配或 OCR。
 
 
 ROWS = 3
 COLS = 9
 
 DEBUG_DIR = "debug"
+BOARD_DEBUG_DIR = os.path.join(DEBUG_DIR, "board")
+SEARCH_DEBUG_DIR = os.path.join(DEBUG_DIR, "search")
 
 
-# ============================================================
-# 中央识别区域
-#
-# 每个方格只取中央区域。
-#
-# 这样可以尽量排除：
-#
-#   方框
-#   边框
-#   外部背景
-# ============================================================
+def get_board_capture_monitor(x1, y1, dx, dy, full_monitor):
+    """根据校准结果生成棋盘截图区域。"""
+    if not CAPTURE_BOARD_ONLY:
+        return full_monitor
+
+    left_center = x1
+    right_center = x1 + (COLS - 1) * dx
+    top_center = y1
+    bottom_center = y1 + (ROWS - 1) * dy
+
+    margin_x = abs(dx) * 0.50
+    margin_y = abs(dy) * 0.50
+
+    left = math.floor(min(left_center, right_center) - margin_x)
+    top = math.floor(min(top_center, bottom_center) - margin_y)
+    right = math.ceil(max(left_center, right_center) + margin_x)
+    bottom = math.ceil(max(top_center, bottom_center) + margin_y)
+
+    screen_left = full_monitor["left"]
+    screen_top = full_monitor["top"]
+    screen_right = screen_left + full_monitor["width"]
+    screen_bottom = screen_top + full_monitor["height"]
+
+    left = max(left, screen_left)
+    top = max(top, screen_top)
+    right = min(right, screen_right)
+    bottom = min(bottom, screen_bottom)
+
+    return {
+        "left": left,
+        "top": top,
+        "width": max(1, right - left),
+        "height": max(1, bottom - top),
+    }
+
+
+def get_capture_board_origin(x1, y1, monitor):
+    """将屏幕绝对坐标转换为当前截图区域内的坐标。"""
+    return (
+        x1 - monitor["left"],
+        y1 - monitor["top"],
+    )
+
+
+def _projection_runs(values, threshold):
+    runs = []
+    start = None
+
+    for index, value in enumerate(values):
+        if value >= threshold:
+            if start is None:
+                start = index
+        elif start is not None:
+            runs.append((start, index - 1))
+            start = None
+
+    if start is not None:
+        runs.append((start, len(values) - 1))
+
+    return runs
+
+
+def refine_grid_geometry(screenshot, x1, y1, dx, dy):
+    """根据格子边框的颜色投影修正 27 个格子的中心位置。"""
+    b, g, r = cv2.split(screenshot)
+    frame_mask = (
+        (r >= 150)
+        & (g >= 90)
+        & (b >= 60)
+        & (r >= g + 25)
+        & (g >= b + 15)
+    )
+
+    x_projection = frame_mask.sum(axis=0)
+    y_projection = frame_mask.sum(axis=1)
+
+    x_runs = _projection_runs(
+        x_projection,
+        max(8, int(frame_mask.shape[0] * 0.08)),
+    )
+    y_runs = _projection_runs(
+        y_projection,
+        max(8, int(frame_mask.shape[1] * 0.08)),
+    )
+
+    def find_centers(runs, expected_start, expected_step, count):
+        pitch = abs(expected_step)
+        if pitch <= 1:
+            return None
+
+        candidates = [
+            run
+            for run in runs
+            if pitch * 0.45 <= run[1] - run[0] + 1 <= pitch * 1.20
+        ]
+
+        centers = []
+        used = set()
+
+        for index in range(count):
+            expected = expected_start + index * expected_step
+            available = [
+                run
+                for run_index, run in enumerate(candidates)
+                if run_index not in used
+                and abs((run[0] + run[1]) / 2 - expected)
+                <= pitch * 0.55
+            ]
+
+            if not available:
+                return None
+
+            run = min(
+                available,
+                key=lambda item: abs(
+                    (item[0] + item[1]) / 2 - expected
+                ),
+            )
+            used.add(candidates.index(run))
+            centers.append((run[0] + run[1]) / 2)
+
+        return centers
+
+    x_centers = find_centers(
+        x_runs,
+        x1,
+        dx,
+        COLS,
+    )
+    y_centers = find_centers(
+        y_runs,
+        y1,
+        dy,
+        ROWS,
+    )
+
+    if x_centers is None or y_centers is None:
+        return None
+
+    return (
+        x_centers[0],
+        y_centers[0],
+        (x_centers[-1] - x_centers[0]) / (COLS - 1),
+        (y_centers[-1] - y_centers[0]) / (ROWS - 1),
+    )
+
+# DEBUG 图片由独立线程顺序写入，避免阻塞主循环的识别、搜索和点击。
+DEBUG_WRITE_QUEUE = queue.Queue()
+DEBUG_WRITER_THREAD = None
+DEBUG_WRITER_STOP = object()
+
+
+def _debug_writer_loop():
+    while True:
+        task = DEBUG_WRITE_QUEUE.get()
+        try:
+            if task is DEBUG_WRITER_STOP:
+                return
+
+            save_board_debug_images(*task)
+        except Exception as exc:
+            print(f"DEBUG 图片保存失败：{exc!r}")
+        finally:
+            DEBUG_WRITE_QUEUE.task_done()
+
+
+def start_debug_writer():
+    global DEBUG_WRITER_THREAD
+
+    if not DEBUG_SAVE_IMAGES:
+        return
+
+    if (
+        DEBUG_WRITER_THREAD is None
+        or not DEBUG_WRITER_THREAD.is_alive()
+    ):
+        DEBUG_WRITER_THREAD = threading.Thread(
+            target=_debug_writer_loop,
+            name="debug-writer",
+            daemon=True,
+        )
+        DEBUG_WRITER_THREAD.start()
+
+
+def enqueue_debug_images(
+    screenshot,
+    x1,
+    y1,
+    dx,
+    dy,
+    debug_dir,
+    step,
+):
+    if not DEBUG_SAVE_IMAGES:
+        return
+
+    start_debug_writer()
+    DEBUG_WRITE_QUEUE.put(
+        (
+            screenshot.copy(),
+            x1,
+            y1,
+            dx,
+            dy,
+            debug_dir,
+            step,
+        )
+    )
+
+
+def finish_debug_writer():
+    global DEBUG_WRITER_THREAD
+
+    if DEBUG_WRITER_THREAD is None:
+        return
+
+    # 退出前等待所有图片写完，确保 DEBUG 文件不会丢失。
+    DEBUG_WRITE_QUEUE.join()
+    DEBUG_WRITE_QUEUE.put(DEBUG_WRITER_STOP)
+    DEBUG_WRITE_QUEUE.join()
+    DEBUG_WRITER_THREAD.join()
+    DEBUG_WRITER_THREAD = None
+
+
+def get_debug_step_dir(step):
+    """返回单次识别对应的 DEBUG 目录，仅在启用 DEBUG 时创建。"""
+
+    step_dir = os.path.join(
+        DEBUG_DIR,
+        f"step_{step:02d}"
+    )
+
+    if DEBUG_SAVE_IMAGES:
+        os.makedirs(
+            step_dir,
+            exist_ok=True
+        )
+
+    return step_dir
+
+
+# 每个方格只取中央区域，尽量排除方框、边框和外部背景。
 
 CENTER_RATIO = 0.82
 
 
-# ============================================================
-# 背景排除
-# ============================================================
-
+# 背景颜色与候选颜色的最小距离。
 BACKGROUND_DISTANCE = 35
 
 
-# ============================================================
-# 最小颜色面积
-# ============================================================
-
+# 小于该比例的颜色区域视为噪声。
 MIN_COLOR_RATIO = 0.005
 
 
-# ============================================================
-# 等级阈值
-#
-# 注意：
-#
-# 这是“颜色像素面积 / 中央识别区域面积”
-#
-# 不是整个球的真实面积。
-#
-# ------------------------------------------------------------
-#
-# 火：
-#   1 / 2 = 0.170
-#   2 / 3 = 0.280
-#
-# 雷：
-#   1 / 2 = 0.315
-#   2 / 3 = 0.395
-#
-# 风：
-#   1 / 2 = 0.375
-#   2 / 3 = 0.600
-#
-# ============================================================
+# 阈值是“颜色像素面积 / 中央识别区域面积”，不是整个球的真实面积。
+# 三种颜色分别设置 1/2 级和 2/3 级分界。
 
 LEVEL_THRESHOLDS = {
 
     "f": {
 
         # 1 / 2 分界
-        "12": 0.170,
+        "12": 0.165,
 
         # 2 / 3 分界
-        "23": 0.280
+        "23": 0.260
     },
 
 
     "r": {
 
         # 1 / 2 分界
-        "12": 0.315,
+        "12": 0.285,
 
         # 2 / 3 分界
-        "23": 0.395
+        "23": 0.410
     },
 
 
     "w": {
 
         # 1 / 2 分界
-        "12": 0.375,
+        "12": 0.315,
 
         # 2 / 3 分界
-        "23": 0.600
+        "23": 0.555
     }
 }
 
 
-# ============================================================
-# 类型名称
-# ============================================================
-
-TYPE_NAME = {
-
-    "f": "火",
-
-    "r": "雷",
-
-    "w": "风",
-
-    "?": "?"
-}
-
-
-# ============================================================
-# 绘图颜色
-# ============================================================
-
+# DEBUG 图片中的 BGR 标注颜色。
 DRAW_COLOR = {
 
     "f": (0, 0, 255),
@@ -169,29 +347,12 @@ DRAW_COLOR = {
 }
 
 
-# ============================================================
-# 鼠标校准
-# ============================================================
-
-
-# V5.3/V5.12 统计计数器（仅用于运行统计，不参与评分）
-V53_STATS = {
-    "quick_candidates": 0,
-    "future_simulations": 0,
-    "cache_hits": 0,
-    "cache_misses": 0,
-}
-
-# ============================================================
-# V5.12 统一采样配置
-# ============================================================
 # 每个补球位置的 f/r/w 严格各占 1/3。
-# Stage 2 使用 6 个样本；Stage 3 使用 9 个样本。
-V512_STAGE2_SAMPLE_COUNT = 6
-V512_STAGE3_SAMPLE_COUNT = 9
+# 所有候选统一使用 9 个样本评估，避免中间阶段因样本过少误淘汰。
+FINAL_SAMPLE_COUNT = 9
 
-# 兼容旧 V5.3 运行统计；只统计计算量，不参与评分。
-V53_STATS = {
+# 搜索运行统计，只用于观察计算量，不参与评分。
+SEARCH_STATS = {
     "quick_candidates": 0,
     "future_simulations": 0,
     "cache_hits": 0,
@@ -199,6 +360,7 @@ V53_STATS = {
 }
 
 def wait_mouse(message):
+    """等待用户确认鼠标位置，并返回当前屏幕坐标。"""
 
     print()
     print(message)
@@ -209,6 +371,11 @@ def wait_mouse(message):
     )
 
     input()
+
+    wait_while_paused()
+
+    if AUTO_STOP_REQUESTED:
+        return None
 
     pos = pyautogui.position()
 
@@ -222,38 +389,45 @@ def wait_mouse(message):
     return x, y
 
 
-# ============================================================
-# 棋盘校准
-# ============================================================
-
 def calibrate():
+    """通过棋盘整体左上角和右下角计算截图区域与网格间距。"""
 
     print()
     print("=" * 80)
     print("框选区域")
     print("=" * 80)
 
-    x1, y1 = wait_mouse(
-        "① 第1行第1列方框中心"
+    first_point = wait_mouse(
+        "① 请移动到第1行第1列格子方框的左上内角，然后按 Enter"
     )
 
-    x2, y2 = wait_mouse(
-        "② 第3行第9列方框中心"
+    if first_point is None:
+        return None
+
+    grid_left, grid_top = first_point
+
+    second_point = wait_mouse(
+        "② 请移动到第3行第9列格子方框的右下内角，然后按 Enter"
     )
 
+    if second_point is None:
+        return None
 
-    dx = (
-        x2 - x1
-    ) / (
-        COLS - 1
-    )
+    grid_right, grid_bottom = second_point
 
+    grid_width = grid_right - grid_left
+    grid_height = grid_bottom - grid_top
 
-    dy = (
-        y2 - y1
-    ) / (
-        ROWS - 1
-    )
+    if grid_width <= 0 or grid_height <= 0:
+        print("校准失败：右下角必须位于左上角的右下方。")
+        return None
+
+    dx = grid_width / COLS
+    dy = grid_height / ROWS
+
+    # x1、y1 始终表示第 1 行第 1 列球的中心，点击坐标仍然准确。
+    x1 = grid_left + dx / 2
+    y1 = grid_top + dy / 2
 
 
     print()
@@ -262,19 +436,19 @@ def calibrate():
     print("=" * 80)
 
     print(
-        f"左上：({x1}, {y1})"
+        f"截图左上角：({grid_left}, {grid_top})"
     )
 
     print(
-        f"右下：({x2}, {y2})"
+        f"截图右下角：({grid_right}, {grid_bottom})"
     )
 
     print(
-        f"横向格距：{dx:.3f}"
+        f"单格宽度：{dx:.3f}"
     )
 
     print(
-        f"纵向格距：{dy:.3f}"
+        f"单格高度：{dy:.3f}"
     )
 
 
@@ -286,10 +460,6 @@ def calibrate():
     )
 
 
-# ============================================================
-# 截取格子
-# ============================================================
-
 def crop_cell(
     screenshot,
     cx,
@@ -297,6 +467,7 @@ def crop_cell(
     cell_w,
     cell_h
 ):
+    """按中心点和尺寸截取格子，越界区域会自动裁剪。"""
 
     h, w = screenshot.shape[:2]
 
@@ -365,11 +536,8 @@ def crop_cell(
     ]
 
 
-# ============================================================
-# 取得中央区域
-# ============================================================
-
 def get_center_region(cell):
+    """截取格子中央区域，减少边框和背景对识别的干扰。"""
 
     h, w = cell.shape[:2]
 
@@ -404,11 +572,8 @@ def get_center_region(cell):
     ]
 
 
-# ============================================================
-# 估计棋盘背景
-# ============================================================
-
 def estimate_background(img):
+    """用格子四角的像素中位数估计当前格子的背景颜色。"""
 
     h, w = img.shape[:2]
 
@@ -487,14 +652,11 @@ def estimate_background(img):
     )
 
 
-# ============================================================
-# 背景距离
-# ============================================================
-
 def get_background_mask(
     img,
     background
 ):
+    """返回与估计背景颜色差异足够大的像素掩码。"""
 
     diff = (
         img.astype(
@@ -523,11 +685,8 @@ def get_background_mask(
     )
 
 
-# ============================================================
-# 创建三种颜色 Mask
-# ============================================================
-
 def make_color_masks(img):
+    """按颜色特征生成火、雷、风三种候选区域掩码。"""
 
     b = img[
         :,
@@ -600,15 +759,7 @@ def make_color_masks(img):
         )
 
 
-    # ========================================================
-    # 火
-    #
-    # 红橙色
-    #
-    # 不能仅仅使用 R > G。
-    #
-    # 因为棋盘背景也是棕橙色。
-    # ========================================================
+    # 火是红橙色，不能只用 R > G，因为棋盘背景也偏棕橙色。
 
     fire_hue = (
         (h <= 15)
@@ -643,11 +794,7 @@ def make_color_masks(img):
     )
 
 
-    # ========================================================
-    # 雷
-    #
-    # 紫色
-    # ========================================================
+    # 雷是紫色。
 
     thunder_hue = (
 
@@ -685,11 +832,7 @@ def make_color_masks(img):
     )
 
 
-    # ========================================================
-    # 风
-    #
-    # 灰蓝色
-    # ========================================================
+    # 风是灰蓝色。
 
     wind_mask = (
 
@@ -713,9 +856,7 @@ def make_color_masks(img):
     )
 
 
-    # ========================================================
-    # 去噪
-    # ========================================================
+    # 开运算去除小噪声。
 
     kernel = np.ones(
         (3, 3),
@@ -750,9 +891,7 @@ def make_color_masks(img):
     )
 
 
-    # ========================================================
-    # 闭运算
-    # ========================================================
+    # 闭运算连接同一能量球中被高光分开的区域。
 
     kernel2 = np.ones(
         (5, 5),
@@ -789,11 +928,8 @@ def make_color_masks(img):
     )
 
 
-# ============================================================
-# 找最佳颜色区域
-# ============================================================
-
 def get_best_component(mask):
+    """从掩码中选择最可能代表能量球的连通区域。"""
 
     h, w = mask.shape
 
@@ -893,113 +1029,11 @@ def get_best_component(mask):
     )
 
 
-# ============================================================
-# 测量区域
-# ============================================================
-
-def measure_component(
-    component
-):
-
-    contours, _ = cv2.findContours(
-        component,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-
-    if not contours:
-
-        return {
-
-            "area": 0,
-
-            "width": 0,
-
-            "height": 0,
-
-            "diameter": 0,
-
-            "circularity": 0
-        }
-
-
-    contour = max(
-        contours,
-        key=cv2.contourArea
-    )
-
-
-    area = cv2.contourArea(
-        contour
-    )
-
-
-    x, y, w, h = \
-        cv2.boundingRect(
-            contour
-        )
-
-
-    perimeter = cv2.arcLength(
-        contour,
-        True
-    )
-
-
-    if perimeter > 0:
-
-        circularity = (
-
-            4.0 *
-            math.pi *
-            area
-            /
-            (
-                perimeter *
-                perimeter
-            )
-        )
-
-    else:
-
-        circularity = 0
-
-
-    diameter = (
-
-        2.0 *
-        math.sqrt(
-            max(area, 0)
-            /
-            math.pi
-        )
-    )
-
-
-    return {
-
-        "area": area,
-
-        "width": w,
-
-        "height": h,
-
-        "diameter": diameter,
-
-        "circularity":
-            circularity
-    }
-
-
-# ============================================================
-# 等级判断
-# ============================================================
-
 def estimate_level(
     color_type,
     ratio
 ):
+    """按颜色对应的面积阈值将能量球判为 1、2 或 3 级。"""
 
     if ratio <= 0:
 
@@ -1012,34 +1046,18 @@ def estimate_level(
         ]
 
 
-    # --------------------------------------------------------
-    # 1级
-    # --------------------------------------------------------
-
     if ratio < thresholds["12"]:
 
         return 1
 
-
-    # --------------------------------------------------------
-    # 2级
-    # --------------------------------------------------------
 
     if ratio < thresholds["23"]:
 
         return 2
 
 
-    # --------------------------------------------------------
-    # 3级
-    # --------------------------------------------------------
-
     return 3
 
-
-# ============================================================
-# 识别单个格子
-# ============================================================
 
 def recognize_cell(
     cell,
@@ -1047,6 +1065,7 @@ def recognize_cell(
     col,
     debug_dir
 ):
+    """识别单个格子的颜色、等级和置信度。"""
 
     center = \
         get_center_region(
@@ -1082,22 +1101,12 @@ def recognize_cell(
     data = {}
 
 
-    # ========================================================
-    # 分析三种颜色
-    # ========================================================
-
     for color_type, mask in \
             masks.items():
 
         component, pixel_area = \
             get_best_component(
                 mask
-            )
-
-
-        measurement = \
-            measure_component(
-                component
             )
 
 
@@ -1120,16 +1129,9 @@ def recognize_cell(
                 pixel_area,
 
             "ratio":
-                ratio,
-
-            "measurement":
-                measurement
+                ratio
         }
 
-
-    # ========================================================
-    # 找颜色
-    # ========================================================
 
     valid = {}
 
@@ -1153,10 +1155,6 @@ def recognize_cell(
             ] = ratio
 
 
-    # ========================================================
-    # 没有颜色
-    # ========================================================
-
     if not valid:
 
         result = {
@@ -1166,12 +1164,6 @@ def recognize_cell(
             "level": 0,
 
             "area_ratio": 0,
-
-            "width_ratio": 0,
-
-            "height_ratio": 0,
-
-            "diameter": 0,
 
             "confidence": 0
         }
@@ -1183,10 +1175,6 @@ def recognize_cell(
         )
 
 
-    # ========================================================
-    # 最大颜色
-    # ========================================================
-
     best_type = max(
         valid,
         key=valid.get
@@ -1197,10 +1185,6 @@ def recognize_cell(
         best_type
     ]
 
-
-    # ========================================================
-    # 第二大颜色
-    # ========================================================
 
     sorted_values = sorted(
         valid.values(),
@@ -1220,10 +1204,6 @@ def recognize_cell(
         second_ratio = 0
 
 
-    # ========================================================
-    # 颜色差距
-    # ========================================================
-
     if best_ratio > 0:
 
         color_gap = (
@@ -1237,61 +1217,17 @@ def recognize_cell(
         color_gap = 0
 
 
-    # ========================================================
-    # 几何
-    # ========================================================
-
-    measurement = data[
-        best_type
-    ]["measurement"]
-
-
-    width_ratio = (
-
-        measurement["width"]
-        /
-        w
-    )
-
-
-    height_ratio = (
-
-        measurement["height"]
-        /
-        h
-    )
-
-
-    diameter = \
-        measurement["diameter"]
-
-
-    # ========================================================
-    # 等级
-    # ========================================================
-
     level = estimate_level(
         best_type,
         best_ratio
     )
 
 
-    # ========================================================
-    # 特殊保护
-    #
-    # 面积特别小：
-    #
-    # 不允许直接成为 3级。
-    # ========================================================
-
+    # 面积特别小时判定为1级
     if best_ratio < 0.08:
 
         level = 1
 
-
-    # ========================================================
-    # 置信度
-    # ========================================================
 
     thresholds = \
         LEVEL_THRESHOLDS[
@@ -1346,10 +1282,6 @@ def recognize_cell(
     )
 
 
-    # ========================================================
-    # 最终
-    # ========================================================
-
     result = {
 
         "type": best_type,
@@ -1358,76 +1290,45 @@ def recognize_cell(
 
         "area_ratio": best_ratio,
 
-        "width_ratio":
-            width_ratio,
-
-        "height_ratio":
-            height_ratio,
-
-        "diameter":
-            diameter,
-
         "confidence":
             confidence
     }
 
 
-    # ========================================================
-    # DEBUG
-    # ========================================================
+    # 保存原始掩码和候选区域，便于定位识别问题。
+    if DEBUG_SAVE_IMAGES and debug_dir is not None:
+        base = os.path.join(
+            debug_dir,
+            f"r{row + 1}c{col + 1}"
+        )
 
-    base = os.path.join(
-        debug_dir,
-        f"r{row + 1}c{col + 1}"
-    )
-
-
-    if DEBUG_SAVE_IMAGES:
         cv2.imwrite(
-        base +
-        "_center.png",
-        center
-    )
+            base + "_center.png",
+            center
+        )
 
-
-    if DEBUG_SAVE_IMAGES:
         cv2.imwrite(
-        base +
-        "_fire.png",
-        fire_mask
-    )
+            base + "_fire.png",
+            fire_mask
+        )
 
-
-    if DEBUG_SAVE_IMAGES:
         cv2.imwrite(
-        base +
-        "_thunder.png",
-        thunder_mask
-    )
+            base + "_thunder.png",
+            thunder_mask
+        )
 
-
-    if DEBUG_SAVE_IMAGES:
         cv2.imwrite(
-        base +
-        "_wind.png",
-        wind_mask
-    )
+            base + "_wind.png",
+            wind_mask
+        )
 
-
-    if DEBUG_SAVE_IMAGES:
         cv2.imwrite(
-        base +
-        "_component.png",
-        data[
-            best_type
-        ]["component"]
-    )
+            base + "_component.png",
+            data[best_type]["component"]
+        )
 
 
-    # ========================================================
-    # Debug 图
-    # ========================================================
-
+    # 生成带轮廓、颜色、等级和面积比例的识别图。
     debug_img = center.copy()
 
 
@@ -1451,12 +1352,7 @@ def recognize_cell(
     )
 
 
-    label = (
-
-        f"{level}{best_type} "
-
-        f"A={best_ratio:.3f}"
-    )
+    label = f"{level}{best_type} {best_ratio:.3f}"
 
 
     cv2.putText(
@@ -1471,12 +1367,11 @@ def recognize_cell(
     )
 
 
-    if DEBUG_SAVE_IMAGES:
+    if DEBUG_SAVE_IMAGES and debug_dir is not None:
         cv2.imwrite(
-        base +
-        "_result.png",
-        debug_img
-    )
+            base + "_result.png",
+            debug_img
+        )
 
 
     return (
@@ -1485,24 +1380,34 @@ def recognize_cell(
     )
 
 
-# ============================================================
-# 主程序
-# ============================================================
-
-
-# ============================================================
-# 暂停/继续控制
-# ============================================================
-
-# F8：暂停 / 继续
-# F9：退出
+# F8 暂停/继续，F9 退出。
 AUTO_PAUSED = False
 AUTO_STOP_REQUESTED = False
+HOTKEYS_REGISTERED = False
 
 
-def setup_hotkeys_v43():
+def request_auto_stop(message="收到停止指令"):
+    """执行统一的停止流程，供 F9 和自动结束条件共同调用。"""
+    global AUTO_STOP_REQUESTED
+
+    if AUTO_STOP_REQUESTED:
+        return
+
+    AUTO_STOP_REQUESTED = True
+    print()
+    print("=" * 90)
+    print(message)
+    print("=" * 90)
+
+
+def setup_hotkeys():
+    """注册全局热键；重复调用时不重复注册。"""
     global AUTO_PAUSED
     global AUTO_STOP_REQUESTED
+    global HOTKEYS_REGISTERED
+
+    if HOTKEYS_REGISTERED:
+        return
 
     def toggle_pause():
         global AUTO_PAUSED
@@ -1521,18 +1426,14 @@ def setup_hotkeys_v43():
             print("=" * 90)
 
     def stop_program():
-        global AUTO_STOP_REQUESTED
-        AUTO_STOP_REQUESTED = True
-        print()
-        print("=" * 90)
-        print("收到停止指令")
-        print("=" * 90)
+        request_auto_stop()
 
     keyboard.add_hotkey("f8", toggle_pause)
     keyboard.add_hotkey("f9", stop_program)
+    HOTKEYS_REGISTERED = True
 
 
-def wait_while_paused_v43():
+def wait_while_paused():
     """
     暂停状态下保持程序运行。
     F8 恢复，F9 退出。
@@ -1541,7 +1442,7 @@ def wait_while_paused_v43():
         time.sleep(0.10)
 
 
-def pause_for_no_move_v43():
+def pause_for_no_move():
     """
     当前没有立即可合成交换时：
     不退出程序，而是自动暂停。
@@ -1563,42 +1464,34 @@ def pause_for_no_move_v43():
     print("=" * 90)
 
 
-# ============================================================
-# 自适应等待 + 自动连续交换
-# ============================================================
-#
-#   交换后检测棋盘图像是否稳定。
-#   棋盘稳定后立即进入下一轮。
-#
-#   普通三连 -> 等待时间短
-#   连锁合成 -> 检测到棋盘持续变化时继续等待
-
-
+# 点击后根据棋盘画面变化自动等待动画结束，再进入下一轮识别。
 AUTO_CLICK_ENABLED = True
 
-# 两次点击之间的间隔
+# 两次点击之间的间隔（秒）。
 AUTO_CLICK_DELAY = 0.12
 
 # 鼠标点击后移到棋盘外，避免指针遮挡小球影响识别
 MOUSE_MOVE_OUT_X = 10
 MOUSE_MOVE_OUT_Y = 10
 
-# 点击完成后，至少等待这么久再开始判断棋盘
-MIN_WAIT_AFTER_SWAP = 0.35
+# 点击完成后，至少等待这么久再开始判断棋盘。
+MIN_WAIT_AFTER_SWAP = 0.20
 
-# 检查棋盘的间隔
+# 第一步通常会启动更长的首次合成动画，单独留出启动时间。
+FIRST_STEP_MIN_WAIT_AFTER_SWAP = 0.80
+
+# 初始随机出球后可能立即触发三连，单独留出合成动画的观察时间。
+# 只在启动时使用一次，不影响后续交换后的快速稳定判断。
+INITIAL_BOARD_STABLE_TIME = 0.80
+
+# 检查棋盘的间隔（秒）。
 BOARD_CHECK_INTERVAL = 0.08
 
-# 棋盘连续稳定这么久，认为动画结束
-BOARD_STABLE_TIME = 0.45
+# 棋盘识别状态连续稳定这么久后，认为动画结束。
+BOARD_STABLE_TIME = 0.25
 
-# 最多等待这么久。
-# 如果游戏动画异常，也不会无限卡住。
+# 最多等待时间，避免游戏动画异常时无限等待。
 MAX_WAIT_AFTER_SWAP = 3.00
-
-# 检测图像变化的阈值。
-# 使用灰度绝对差的平均值。
-BOARD_CHANGE_THRESHOLD = 2.5
 
 # 自动运行最长时间（秒）
 GAME_MAX_SECONDS = 3600.0
@@ -1611,102 +1504,213 @@ def get_cell_center_from_board(r, c, x1, y1, dx, dy):
     )
 
 
-def get_board_detection_region(screenshot, x1, y1, dx, dy):
+def recognize_board_snapshot(screenshot, x1, y1, dx, dy):
     """
-    只截取棋盘区域，不检测整个屏幕。
+    识别整张 3×9 棋盘，并返回棋盘状态。
 
-    边界覆盖 3×9 棋盘，并留少量余量。
+    棋盘状态只包含“颜色 + 等级”，不包含面积比例等易波动数据。
+    因此稳定判断不会因为动画中的轻微亮度变化而误判为新棋盘。
     """
-    h, w = screenshot.shape[:2]
+    cell_w = abs(dx) * 0.90
+    cell_h = abs(dy) * 0.90
+    board = []
+    unknown_count = 0
 
-    left = int(round(x1 - abs(dx) * 0.55))
-    top = int(round(y1 - abs(dy) * 0.55))
+    for row in range(ROWS):
+        board_row = []
 
-    right = int(round(
-        x1 + 8 * dx + abs(dx) * 0.55
-    ))
+        for col in range(COLS):
+            cx = x1 + col * dx
+            cy = y1 + row * dy
+            cell = crop_cell(
+                screenshot,
+                cx,
+                cy,
+                cell_w,
+                cell_h,
+            )
 
-    bottom = int(round(
-        y1 + 2 * dy + abs(dy) * 0.55
-    ))
+            if cell is None:
+                result = {
+                    "type": "?",
+                    "level": 0,
+                    "area_ratio": 0,
+                    "confidence": 0,
+                }
+            else:
+                result, _ = recognize_cell(
+                    cell,
+                    row,
+                    col,
+                    None,
+                )
 
-    left = max(0, min(w - 1, left))
-    top = max(0, min(h - 1, top))
-    right = max(left + 1, min(w, right))
-    bottom = max(top + 1, min(h, bottom))
+            if result["type"] == "?":
+                unknown_count += 1
 
-    return screenshot[top:bottom, left:right]
+            board_row.append(result)
+
+        board.append(board_row)
+
+    if unknown_count > 0:
+        return board, unknown_count, None
+
+    board_state = make_board_state(board)
+    return board, 0, board_state
 
 
-def capture_board_region(sct, monitor, x1, y1, dx, dy):
-    """
-    使用 MSS 直接截取棋盘区域。
-    """
+def save_board_debug_images(
+    screenshot,
+    x1,
+    y1,
+    dx,
+    dy,
+    debug_dir,
+    step,
+):
+    """保存一次已完成交换对应的棋盘和逐格 DEBUG 图片。"""
 
-    screen_w = monitor["width"]
-    screen_h = monitor["height"]
-
-    left = int(round(x1 - abs(dx) * 0.55))
-    top = int(round(y1 - abs(dy) * 0.55))
-
-    width = int(round(abs(dx) * 8 + abs(dx) * 1.10))
-    height = int(round(abs(dy) * 2 + abs(dy) * 1.10))
-
-    left = max(0, min(screen_w - 1, left))
-    top = max(0, min(screen_h - 1, top))
-
-    width = max(1, min(screen_w - left, width))
-    height = max(1, min(screen_h - top, height))
-
-    raw = np.array(
-        sct.grab({
-            "left": left,
-            "top": top,
-            "width": width,
-            "height": height,
-        })
+    os.makedirs(
+        BOARD_DEBUG_DIR,
+        exist_ok=True,
     )
 
-    return cv2.cvtColor(
-        raw,
-        cv2.COLOR_BGRA2GRAY
+    cv2.imwrite(
+        os.path.join(
+            debug_dir,
+            "board.png"
+        ),
+        screenshot
     )
 
-
-def board_image_difference(a, b):
-    """
-    返回两个棋盘截图的平均像素变化。
-
-    为了降低鼠标指针/轻微渲染变化影响，
-    先做轻微模糊，再计算平均绝对差。
-    """
-
-    if a is None or b is None:
-        return float("inf")
-
-    if a.shape != b.shape:
-        return float("inf")
-
-    a_blur = cv2.GaussianBlur(
-        a,
-        (5, 5),
-        0
+    # 独立目录按成功交换步数保存；step 目录保存对应的历史记录。
+    cv2.imwrite(
+        os.path.join(
+            BOARD_DEBUG_DIR,
+            f"board_{step:02d}.png",
+        ),
+        screenshot,
     )
 
-    b_blur = cv2.GaussianBlur(
-        b,
-        (5, 5),
-        0
+    cell_w = abs(dx) * 0.90
+    cell_h = abs(dy) * 0.90
+
+    for row in range(ROWS):
+        for col in range(COLS):
+            cx = x1 + col * dx
+            cy = y1 + row * dy
+
+            cell = crop_cell(
+                screenshot,
+                cx,
+                cy,
+                cell_w,
+                cell_h
+            )
+
+            if cell is not None:
+                recognize_cell(
+                    cell,
+                    row,
+                    col,
+                    debug_dir
+                )
+
+
+def wait_for_initial_board_ready(sct, monitor, x1, y1, dx, dy):
+    """等待 27 个球全部识别成功且棋盘状态稳定后返回截图。"""
+
+    print("等待能量球出现...", end="", flush=True)
+
+    capture_x1, capture_y1 = get_capture_board_origin(
+        x1,
+        y1,
+        monitor,
     )
 
-    diff = cv2.absdiff(
-        a_blur,
-        b_blur
-    )
+    previous_state = None
+    stable_start = None
+    refined_geometry = None
 
-    return float(
-        np.mean(diff)
-    )
+    while True:
+        if AUTO_STOP_REQUESTED:
+            return None
+
+        wait_while_paused()
+
+        if AUTO_STOP_REQUESTED:
+            return None
+
+        raw = np.array(
+            sct.grab(
+                monitor
+            )
+        )
+
+        screenshot = cv2.cvtColor(
+            raw,
+            cv2.COLOR_BGRA2BGR
+        )
+
+        _, unknown_count, current_state = (
+            recognize_board_snapshot(
+                screenshot,
+                capture_x1,
+                capture_y1,
+                dx,
+                dy,
+            )
+        )
+
+        if unknown_count == 0 and refined_geometry is None:
+            refined_geometry = refine_grid_geometry(
+                screenshot,
+                capture_x1,
+                capture_y1,
+                dx,
+                dy,
+            )
+
+            if refined_geometry is not None:
+                capture_x1, capture_y1, dx, dy = refined_geometry
+                _, unknown_count, current_state = (
+                    recognize_board_snapshot(
+                        screenshot,
+                        capture_x1,
+                        capture_y1,
+                        dx,
+                        dy,
+                    )
+                )
+
+        if unknown_count > 0:
+            stable_start = None
+            previous_state = None
+            print(
+                f"\r等待能量球出现... 已识别 "
+                f"{ROWS * COLS - unknown_count}/{ROWS * COLS} 个",
+                end="",
+                flush=True
+            )
+        elif current_state != previous_state:
+            previous_state = current_state
+            stable_start = time.monotonic()
+        elif (
+            time.monotonic() - stable_start
+            >= INITIAL_BOARD_STABLE_TIME
+        ):
+            print(
+                "\r已识别到完整棋盘（27个能量球）。        "
+            )
+            return (
+                raw,
+                capture_x1,
+                capture_y1,
+                dx,
+                dy,
+            )
+
+        time.sleep(BOARD_CHECK_INTERVAL)
 
 
 def wait_for_board_stable(
@@ -1715,46 +1719,36 @@ def wait_for_board_stable(
     x1,
     y1,
     dx,
-    dy
+    dy,
+    minimum_wait=None,
 ):
     """
     交换完成后等待棋盘稳定。
 
-    状态：
-
-        点击
-         ↓
-        最短等待
-         ↓
-        截图比较
-         ↓
-        发生变化 -> stable_time 清零
-         ↓
-        没变化 -> 累计稳定时间
-         ↓
-        稳定达到 BOARD_STABLE_TIME
-         ↓
-        返回
+    只有在完整识别到 27 格且棋盘状态连续不变时返回。
     """
 
-    time.sleep(
-        MIN_WAIT_AFTER_SWAP
+    if minimum_wait is None:
+        minimum_wait = MIN_WAIT_AFTER_SWAP
+
+    time.sleep(minimum_wait)
+
+    capture_x1, capture_y1 = get_capture_board_origin(
+        x1,
+        y1,
+        monitor,
     )
 
     start_time = time.monotonic()
 
-    previous = capture_board_region(
-        sct,
-        monitor,
-        x1,
-        y1,
-        dx,
-        dy
-    )
-
+    previous_state = None
     stable_start = None
 
     while True:
+
+        if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
+            print("\r收到停止指令，停止等待棋盘稳定。")
+            return time.monotonic() - start_time
 
         elapsed = (
             time.monotonic()
@@ -1773,78 +1767,74 @@ def wait_for_board_stable(
             return elapsed
 
 
-        time.sleep(
-            BOARD_CHECK_INTERVAL
-        )
+        time.sleep(BOARD_CHECK_INTERVAL)
 
-
-        current = capture_board_region(
-            sct,
-            monitor,
-            x1,
-            y1,
-            dx,
-            dy
-        )
-
-
-        difference = \
-            board_image_difference(
-                previous,
-                current
+        raw = np.array(
+            sct.grab(
+                monitor
             )
+        )
+        screenshot = cv2.cvtColor(
+            raw,
+            cv2.COLOR_BGRA2BGR
+        )
 
+        _, unknown_count, current_state = (
+            recognize_board_snapshot(
+                screenshot,
+                capture_x1,
+                capture_y1,
+                dx,
+                dy,
+            )
+        )
+
+        if unknown_count > 0:
+            previous_state = None
+            stable_start = None
+            print(
+                f"\r等待棋盘稳定... 已识别 "
+                f"{ROWS * COLS - unknown_count}/{ROWS * COLS} 个",
+                end="",
+                flush=True,
+            )
+            continue
+
+        if current_state != previous_state:
+            previous_state = current_state
+            stable_start = time.monotonic()
+            print(
+                "\r棋盘状态发生变化，重新等待稳定...     ",
+                end="",
+                flush=True,
+            )
+            continue
+
+        stable_elapsed = time.monotonic() - stable_start
+        print(
+            f"\r检测棋盘状态稳定：{stable_elapsed:.2f}s",
+            end="",
+            flush=True,
+        )
+
+        if stable_elapsed < BOARD_STABLE_TIME:
+            continue
 
         print(
-            f"\r  检测棋盘稳定："
-            f"{elapsed:.2f}s "
-            f"变化={difference:.2f}",
-            end="",
-            flush=True
+            f"\r棋盘已稳定，等待 {elapsed:.2f}s。              "
         )
+        return elapsed
 
 
-        if difference <= \
-                BOARD_CHANGE_THRESHOLD:
-
-            if stable_start is None:
-
-                stable_start = \
-                    time.monotonic()
-
-            stable_elapsed = (
-                time.monotonic()
-                -
-                stable_start
-            )
-
-            if stable_elapsed >= \
-                    BOARD_STABLE_TIME:
-
-                print(
-                    f"\r  棋盘已稳定，"
-                    f"等待 {elapsed:.2f}s。"
-                    f"              "
-                )
-
-                return elapsed
-
-        else:
-
-            stable_start = None
-
-
-        previous = current
-
-
-def click_best_swap_v43(
+def click_best_swap(
     results,
     x1,
     y1,
     dx,
     dy,
     sct,
-    monitor
+    monitor,
+    step=1,
 ):
     """
     执行当前一步最优交换，然后等待棋盘稳定。
@@ -1854,11 +1844,14 @@ def click_best_swap_v43(
         False = 没有可执行交换
     """
 
+    if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
+        return False
+
     if not results:
 
         print()
         print("=" * 90)
-        print("V4.3 自动操作")
+        print("自动操作")
         print("=" * 90)
         print("没有可以立即合成的交换，本轮停止。")
 
@@ -1913,9 +1906,7 @@ def click_best_swap_v43(
         )
 
 
-    # --------------------------------------------------------
-    # 执行交换
-    # --------------------------------------------------------
+    # 执行交换。
 
     pyautogui.click(
         x1_click,
@@ -1925,6 +1916,9 @@ def click_best_swap_v43(
     time.sleep(
         AUTO_CLICK_DELAY
     )
+
+    if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
+        return False
 
     pyautogui.click(
         x2_click,
@@ -1947,25 +1941,27 @@ def click_best_swap_v43(
         x1,
         y1,
         dx,
-        dy
+        dy,
+        minimum_wait=(
+            FIRST_STEP_MIN_WAIT_AFTER_SWAP
+            if step == 1
+            else MIN_WAIT_AFTER_SWAP
+        ),
     )
 
 
     return True
 
 
-def run_auto_loop_v43(
+def run_auto_loop(
     x1,
     y1,
     dx,
     dy
 ):
     global AUTO_STOP_REQUESTED
-    STOP_EVENT.clear()
-    AUTO_STOP_REQUESTED = False
-    AUTO_STOP_REQUESTED = False
     """
-    V4.3 主循环：
+    自动运行主循环：
 
         截图
         ↓
@@ -1985,12 +1981,27 @@ def run_auto_loop_v43(
     loop_start = time.monotonic()
 
     move_count = 0
+    debug_step_count = 0
+    last_unknown_count = None
+    waiting_for_board = False
 
-    setup_hotkeys_v43()
+    setup_hotkeys()
 
     with mss.MSS() as sct:
 
-        monitor = sct.monitors[0]
+        full_monitor = sct.monitors[0]
+        monitor = get_board_capture_monitor(
+            x1,
+            y1,
+            dx,
+            dy,
+            full_monitor,
+        )
+        capture_x1, capture_y1 = get_capture_board_origin(
+            x1,
+            y1,
+            monitor,
+        )
 
 
         while True:
@@ -1998,14 +2009,12 @@ def run_auto_loop_v43(
             if AUTO_STOP_REQUESTED:
                 break
 
-            wait_while_paused_v43()
+            wait_while_paused()
 
             if AUTO_STOP_REQUESTED:
                 break
 
-            # ------------------------------------------------
-            # 游戏时间保护
-            # ------------------------------------------------
+            # 防止异常情况下无限运行。
 
             elapsed = (
                 time.monotonic()
@@ -2031,22 +2040,19 @@ def run_auto_loop_v43(
 
 
             move_count += 1
+            if not waiting_for_board:
+                print()
+                print(
+                    "=" * 90
+                )
+
+                print(
+                    f"自动第 "
+                    f"{move_count} 步"
+                )
 
 
-            print()
-            print(
-                "=" * 90
-            )
-
-            print(
-                f"自动第 "
-                f"{move_count} 步"
-            )
-
-
-            # ------------------------------------------------
-            # 截图
-            # ------------------------------------------------
+            # 截取当前棋盘。
 
 
             raw = np.array(
@@ -2062,10 +2068,7 @@ def run_auto_loop_v43(
                     cv2.COLOR_BGRA2BGR
                 )
 
-
-            # ------------------------------------------------
-            # 识别
-            # ------------------------------------------------
+            # 识别 3×9 个格子。
 
             cell_w = abs(dx) * 0.90
             cell_h = abs(dy) * 0.90
@@ -2082,12 +2085,12 @@ def run_auto_loop_v43(
                 for col in range(COLS):
 
                     cx = (
-                        x1 +
+                        capture_x1 +
                         col * dx
                     )
 
                     cy = (
-                        y1 +
+                        capture_y1 +
                         row * dy
                     )
 
@@ -2107,9 +2110,6 @@ def run_auto_loop_v43(
                             "type": "?",
                             "level": 0,
                             "area_ratio": 0,
-                            "width_ratio": 0,
-                            "height_ratio": 0,
-                            "diameter": 0,
                             "confidence": 0,
                         }
 
@@ -2120,7 +2120,7 @@ def run_auto_loop_v43(
                                 cell,
                                 row,
                                 col,
-                                DEBUG_DIR
+                                None
                             )
 
 
@@ -2134,9 +2134,7 @@ def run_auto_loop_v43(
                 )
 
 
-            # ------------------------------------------------
-            # 检查是否有识别失败
-            # ------------------------------------------------
+            # 有未知格子时只等待，不执行点击。
 
             unknown_count = sum(
                 1
@@ -2148,14 +2146,28 @@ def run_auto_loop_v43(
 
             if unknown_count > 0:
 
-                print(
-                    f"警告：本轮有 "
-                    f"{unknown_count} 个格子无法识别。"
-                )
+                # 20 步完成后如果下一轮整盘都无法识别，通常表示游戏已结束。
+                # 使用与 F9 相同的停止流程，不再继续等待或误执行第 21 步。
+                if (
+                    debug_step_count >= TOTAL_GAME_MOVES
+                    and unknown_count == ROWS * COLS
+                ):
+                    move_count -= 1
+                    request_auto_stop(
+                        "已完成 20 步，棋盘未识别到能量球，自动执行 F9"
+                    )
+                    break
 
-                print(
-                    "为安全起见，本轮不点击。"
-                )
+                if unknown_count != last_unknown_count:
+                    print(
+                        f"\r本轮未识别到{unknown_count}个能量球，等待中..."
+                        "          ",
+                        end="",
+                        flush=True
+                    )
+
+                last_unknown_count = unknown_count
+                waiting_for_board = True
 
                 move_count -= 1
 
@@ -2165,10 +2177,18 @@ def run_auto_loop_v43(
 
                 continue
 
+            if waiting_for_board:
+                print(
+                    "\r" + " " * 60 + "\r",
+                    end="",
+                    flush=True
+                )
 
-            # ------------------------------------------------
-            # 计算当前最优交换
-            # ------------------------------------------------
+            last_unknown_count = None
+            waiting_for_board = False
+
+
+            # 计算当前最优交换。
 
             board_state = \
                 make_board_state(
@@ -2183,46 +2203,41 @@ def run_auto_loop_v43(
 
             try:
                 results = \
-                    analyze_all_swaps_v50_1(
+                    analyze_all_swaps(
                         board_state,
                         current_step=move_count
                     )
             except StopIteration:
-                # 用户按下停止热键时，搜索线程/阶段会通过
-                # StopIteration 终止计算；这属于正常退出路径，
-                # 不应显示为“程序发生错误”。
+                # StopIteration 表示热键触发的正常停止，不视为程序错误。
                 print()
                 print("=" * 90)
                 print("收到停止指令，停止当前搜索。")
                 print("=" * 90)
                 break
 
-            # 搜索过程中收到停止指令时，即使分析器已经返回，
-            # 也不能继续点击下一步。
+            # 搜索完成后再次检查停止状态，避免误执行点击。
             if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
                 print()
                 print("收到停止指令，不执行本轮交换。")
                 break
 
-            print_swap_results_v50_1(
-                results
+            save_swap_results(
+                results,
+                move_count,
             )
 
 
             if not results:
 
-                # 没有立即可合成交换时暂停，
-                # 不结束整个程序。
-                pause_for_no_move_v43()
+                # 没有立即可合成交换时暂停，等待用户处理。
+                pause_for_no_move()
 
                 if AUTO_STOP_REQUESTED:
                     break
 
-                # 等待用户 F8 恢复。
-                wait_while_paused_v43()
+                wait_while_paused()
 
-                # 用户恢复后，重新执行本轮识别。
-                # 当前 move 不算一次真正执行的交换。
+                # 恢复后重新识别；本轮不计入实际交换步数。
                 move_count -= 1
 
                 continue
@@ -2233,19 +2248,36 @@ def run_auto_loop_v43(
             )
 
 
-            # ------------------------------------------------
-            # 执行一次
-            # ------------------------------------------------
+            # 执行选中的交换。
 
-            click_best_swap_v43(
+            swap_completed = click_best_swap(
                 results,
                 x1,
                 y1,
                 dx,
                 dy,
                 sct,
-                monitor
+                monitor,
+                step=move_count,
             )
+
+            if swap_completed:
+                debug_step_count += 1
+
+                if DEBUG_SAVE_IMAGES:
+                    debug_step_dir = get_debug_step_dir(
+                        debug_step_count
+                    )
+
+                    enqueue_debug_images(
+                        screenshot,
+                        capture_x1,
+                        capture_y1,
+                        dx,
+                        dy,
+                        debug_step_dir,
+                        debug_step_count,
+                    )
 
 
     print()
@@ -2384,67 +2416,6 @@ def find_matches(board):
     )
 
 
-def _line_match_at(board, r, c, dr, dc):
-    """只检查一个位置所在的连续同球区域。"""
-    ball = board[r][c]
-    if not mergeable(ball):
-        return None
-
-    positions = [(r, c)]
-
-    rr, cc = r + dr, c + dc
-    while 0 <= rr < ROWS and 0 <= cc < COLS and same_ball(ball, board[rr][cc]):
-        positions.append((rr, cc))
-        rr += dr
-        cc += dc
-
-    rr, cc = r - dr, c - dc
-    while 0 <= rr < ROWS and 0 <= cc < COLS and same_ball(ball, board[rr][cc]):
-        positions.append((rr, cc))
-        rr -= dr
-        cc -= dc
-
-    return positions if len(positions) >= 3 else None
-
-
-def find_matches_after_swap(board, p1, p2):
-    """
-    交换只改变 p1 / p2 两个格子。
-    如果交换前棋盘已经稳定，那么新产生的三连一定经过
-    p1 或 p2，因此不需要再扫描整个 27 格棋盘。
-    """
-    simulated = swap_cells(board, p1, p2)
-    found = []
-    seen = set()
-
-    for r, c in (p1, p2):
-        for dr, dc in ((0, 1), (1, 0)):
-            group = _line_match_at(simulated, r, c, dr, dc)
-            if group:
-                key = frozenset(group)
-                if key not in seen:
-                    seen.add(key)
-                    found.append(group)
-
-    return simulated, found
-
-
-
-
-
-
-def analyze_all_swaps(board):
-    results = []
-
-    for p1, p2 in generate_all_swaps():
-        result = evaluate_swap(board, p1, p2)
-        if result is not None:
-            results.append(result)
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results
-
-
 def print_match_group(group, board):
     ball = board[group[0][0]][group[0][1]]
     positions = " ".join(position_name(p) for p in group)
@@ -2454,135 +2425,9 @@ def print_match_group(group, board):
     )
 
 
-def print_swap_results(results):
-    print()
-    print("=" * 90)
-    print("可立即产生合成的交换")
-    print("=" * 90)
-
-    if not results:
-        print()
-        print("当前没有发现能够立即形成三连的交换。")
-        return
-
-    for i, result in enumerate(results, 1):
-        print()
-        print(
-            f"{i}. "
-            f"{position_name(result['p1'])} <-> "
-            f"{position_name(result['p2'])} "
-            f"评分={result['score']}"
-        )
-
-        print("   合成组合：")
-
-        for group in result["matches"]:
-            print_match_group(
-                group,
-                result["board"]
-            )
-
-
-def print_best_swap(results):
-    print()
-    print("=" * 90)
-    print("推荐交换")
-    print("=" * 90)
-
-    if not results:
-        print()
-        print("没有找到可以立即合成的交换。")
-        return
-
-    best = results[0]
-
-    print()
-    print(
-        f"第1步：点击 {position_name(best['p1'])}"
-    )
-
-    print(
-        f"第2步：点击 {position_name(best['p2'])}"
-    )
-
-    print()
-    print(f"当前交换收益：{best.get('immediate_gain', 0.0):.2f}")
-    print(
-        "当前交换后连锁："
-        f"{best.get('current_chain_gain', best.get('chain_gain', 0.0)):.2f}"
-    )
-
-    next_p1 = best.get("next_p1")
-    next_p2 = best.get("next_p2")
-
-    if next_p1 is not None and next_p2 is not None:
-        print(
-            "下一步期望最优交换："
-            f"{position_name(next_p1)} <-> {position_name(next_p2)}"
-        )
-
-    print(
-        f"下一步交换收益期望：{best.get('next_gain', 0.0):.2f}"
-    )
-    print(
-        f"下一步交换后连锁期望："
-        f"{best.get('next_chain_gain', 0.0):.2f}"
-    )
-    print(
-        f"FutureGain：{best.get('future_gain', 0.0):.2f}"
-    )
-    print(
-        f"board_potential（仅辅助）："
-        f"{best.get('potential', 0.0):.2f}"
-    )
-
-    print()
-    print("当前交换后产生：")
-
-    for group in best["matches"]:
-        print_match_group(
-            group,
-            best["board"]
-        )
-
-
-
-def print_simulated_board(result):
-    if result is None:
-        return
-
-    print()
-    print("=" * 90)
-    print("推荐交换后的棋盘")
-    print("=" * 90)
-
-    board = result["board"]
-
-    for r in range(ROWS):
-        print(
-            f"第{r + 1}行： "
-            + "   ".join(
-                cell_to_text(board[r][c])
-                for c in range(COLS)
-            )
-        )
-
-
-
-# ============================================================
-# 两层前瞻搜索
-# ============================================================
-
-LOOKAHEAD_SAMPLES = 18
-LOOKAHEAD_WEIGHT = 0.65
-CHAIN_WEIGHT = 1.15
-
-# ============================================================
-# V5.2 搜索 / 评分 / 合成模拟器
-#
+# 搜索、评分与合成模拟
 # 重要：
 #   下面的规则以已确认的真实游戏行为为准。
-#
 #   1. 3×9 棋盘，无下落。
 #   2. 交换可以是任意两格：C(27,2)=351。
 #   3. 候选组合按“最下方 -> 最左侧”比较整个组合。
@@ -2597,15 +2442,9 @@ CHAIN_WEIGHT = 1.15
 #        火 / 雷 / 风，各 1/3。
 #   8. 补球后重新扫描；如果出现多个组合，继续使用同一
 #      全局优先级。
-#
-# 搜索：
-#   351 全交换 -> 快速真实模拟 -> Top30
-#   -> 64 次随机期望 -> Top10
-#   -> 128 次随机期望 -> Top5
-#   -> 256 次高精度期望
-#
-# 注意：基础模拟器是 ground truth；评分只决定“选哪一步”。
-# ============================================================
+# 搜索流程：
+#   枚举 351 种交换 -> 按即时收益筛选 -> 采样评估后续收益。
+# 合成模拟决定真实收益；评分只用于在候选交换中排序。
 
 BALL_ENERGY = {
     "f": {1: 5.0, 2: 20.0, 3: 80.0},
@@ -2614,26 +2453,13 @@ BALL_ENERGY = {
 }
 
 TYPE_ORDER = ("f", "r", "w")
-TYPE_NAMES = {"f": "火", "r": "雷", "w": "风"}
 
-# ---------- 搜索参数 ----------
-SEARCH_TOP_K = 30
-LOOKAHEAD_TOP_K = 10
-FINAL_TOP_K = 5
-
-SAMPLES_TOP_K = 64
-SAMPLES_MID_K = 128
-SAMPLES_FINAL_K = 256
-
-SEARCH_WORKERS = 16
-
-# ---------- 评分参数 ----------
-# 权重集中放在这里，后续做 benchmark 时只需要修改这里。
+# 评分参数集中在此，便于统一调整。
 SCORE_WEIGHTS = {
     # 当前交换/当前完整连锁的真实能量
     "immediate": 1.00,
 
-    # V5.7 保留该配置项供旧逻辑兼容；最终评分不再折扣 FutureGain。
+    # 保留该权重字段；最终评分不对后续收益做额外折扣。
     "future": 1.00,
 
     # 当前一步中额外发生的连锁收益
@@ -2649,12 +2475,10 @@ SCORE_WEIGHTS = {
     "mobility": 0.25,
 }
 
-# 让随机前瞻使用同一批种子比较候选，降低候选间的 Monte Carlo 方差。
+# 让随机前瞻使用同一批种子比较候选，降低候选间的随机采样误差。
 LOOKAHEAD_SEED_BASE = 0x5A17C9
 
-# ============================================================
 # 基础棋盘操作
-# ============================================================
 
 def match_anchor(group):
     """游戏全局排序：最下方优先，其次最左侧。"""
@@ -2799,9 +2623,7 @@ def resolve_merges(board, max_rounds=20):
         total_gain += gain
         rounds += 1
 
-        # 每个被合成的位置产生空位，原地补一级球。
-        # 使用独立 RNG 时由调用者负责确定随机结果。
-        # 这里先保留空位，由 resolve_merges_with_refill 负责补球。
+        # 空位暂时保留，由 resolve_with_refill 统一补球。
 
         if rounds >= max_rounds:
             break
@@ -2809,36 +2631,10 @@ def resolve_merges(board, max_rounds=20):
     return state, total_merges, total_gain
 
 
-def resolve_one_round(board):
-    """
-    只执行一次“当前已有组合”的同轮合成，不补球。
-    返回：
-        state, merge_count, gain, empty_count
-    """
-    matches = find_matches(board)
-
-    if not matches:
-        return copy_board(board), 0, 0.0, 0
-
-    expanded = expand_matches(matches)
-    selected = choose_merge_groups(expanded)
-
-    if not selected:
-        return copy_board(board), 0, 0.0, 0
-
-    state, count, gain = apply_merge_groups(
-        board,
-        selected
-    )
-
-    return state, count, gain, len(empty_cells(state))
-
-
 def refill_random(board, rng):
     state = copy_board(board)
 
-    # V5.12 分层 RNG：每一次独立补球事件重新编号空位。
-    # 普通 random.Random 没有 begin_refill()，因此保持兼容。
+    # 分层 RNG 需要在每轮补球前重置位置编号；普通 RNG 不需要。
     begin_refill = getattr(rng, "begin_refill", None)
     if begin_refill is not None:
         begin_refill()
@@ -2905,7 +2701,7 @@ def level3_position_quality(board):
       - 周围同属性一级/二级球越多，说明三级球当前占据的位置越可能
         需要被挪动；
       - 边缘位置天然比中间位置更容易处理。
-    该项只作为 tie-break / 小修正，不改变真实能量价值。
+     该项只作为次级排序的小修正，不改变真实能量价值。
     """
     score = 0.0
 
@@ -3021,8 +2817,7 @@ def evaluate_swap(board, p1, p2):
             score=0.0,
         )
 
-    # 关键修正：这里不能只 resolve_one_round。
-    # 必须把“第一次补球之前”的确定性连续合成全部吃完。
+    # 交换后先把第一次补球之前的确定性连续合成全部处理完。
     resolved, merge_count, merge_gain = resolve_merges(
         simulated,
         max_rounds=20,
@@ -3071,12 +2866,10 @@ CANDIDATE_FIELDS = (
 
 
 
-def _v53_board_key(board):
+def _board_cache_key(board):
     """
-    V5.3/V5.12 兼容棋盘缓存键。
-
     将棋盘规范化成不可变 tuple，避免直接使用 list 作为 dict key。
-    不参与评分，只用于缓存。
+    仅用于缓存，不参与评分。
     """
     rows = []
     for row in board:
@@ -3090,10 +2883,8 @@ def _v53_board_key(board):
     return tuple(rows)
 
 
-def _v53_unique_fast(candidates):
+def _unique_swap_candidates(candidates):
     """
-    V5.3 兼容的快速去重。
-
     保持候选第一次出现的顺序，以 (p1,p2) 为唯一键。
     不改变候选评分，也不改变交换合法性。
     """
@@ -3132,7 +2923,7 @@ def make_candidate(
     potential=0.0, potential_bonus=0.0,
     real_score=None, final_score=None,
 ):
-    """统一候选结构；旧字段只作为兼容别名。"""
+    """构造统一的交换候选结果。"""
     immediate = float(
         merge_gain if immediate_gain is None else immediate_gain
     )
@@ -3174,7 +2965,7 @@ def make_candidate(
         "final_score": float(final_score),
         "quick_score": quick,
 
-        # 兼容字段
+        # 与核心字段同步的派生字段
         "merge_gain": immediate,
         "merge_count": int(merge_count or 0),
         "score": float(final_score),
@@ -3241,56 +3032,18 @@ def assert_candidate(candidate):
     return candidate
 
 
-# V5.12 搜索配置。
-V53_FAST_FILTER_TOP = 30
-V53_DEEP_TOP = 6
-V53_CACHE_MAX = 30000
-V53_BENCHMARK = False
+# 搜索配置。
+# 减少后续随机模拟数量，在速度和搜索范围之间取平衡。
+FAST_FILTER_LIMIT = 12
+# 只并行随机评估；截图、识别和点击始终由主线程执行。
+EVALUATION_WORKERS = 6
+EVALUATION_CACHE_LIMIT = 30000
 
-# ============================================================
-# 第一阶段：351 全交换快速搜索
-# ============================================================
+# 游戏通常进行 20 步。这里只控制评分是否继续看下一步，
+# 不是运行步数上限，因此偶发执行到第 21 步时仍然可以继续运行。
+TOTAL_GAME_MOVES = 20
 
-def analyze_all_swaps_basic(board):
-    results = []
-
-    for p1, p2 in generate_all_swaps():
-        result = evaluate_swap(board, p1, p2)
-
-        # V5.2 第一阶段允许“立即没有三连”的交换进入候选，
-        # 因为它们可能通过下一次随机状态获得更高期望。
-        if result is not None:
-            results.append(result)
-
-    results.sort(
-        key=lambda x: (
-            x["score"],
-            board_potential(x["board"])
-        ),
-        reverse=True
-    )
-
-    return results
-
-
-# ============================================================
-# 随机前瞻
-# ============================================================
-
-def make_seed_list(samples, stage):
-    return [
-        (
-            LOOKAHEAD_SEED_BASE
-            + stage * 1000003
-            + i * 9176
-        )
-        & ((1 << 63) - 1)
-        for i in range(samples)
-    ]
-
-
-
-
+# 下一步交换候选
 
 def _future_legal_swaps(board):
     """
@@ -3314,14 +3067,13 @@ def _future_legal_swaps(board):
 
 
 @dataclass(frozen=True)
-class V512SamplePlan:
+class SamplingPlan:
     """
-    V5.12 唯一的 sample/seed 数据载体。
+    一次评估使用的随机种子集合。
 
-    内部所有 sampling/evaluation 函数只接收 SamplePlan，
-    不再混用 seed 列表、sample_count 整数等参数。
+    所有采样与评估函数都接收该对象，避免混用种子列表和样本数量。
     """
-    stage: int
+    pass_index: int
     seeds: tuple
 
     @property
@@ -3329,51 +3081,45 @@ class V512SamplePlan:
         return len(self.seeds)
 
 
-def make_v512_sample_plan(stage, count):
+def make_sampling_plan(pass_index, count):
     """
-    唯一的 SamplePlan 创建入口。
-    seeds 永远是 tuple[int, ...]；count 永远通过 len(seeds) 得到。
+    创建固定样本数的随机种子计划。
     """
-    stage = int(stage)
+    pass_index = int(pass_index)
     count = int(count)
 
     if count <= 0 or count % 3 != 0:
         raise ValueError(
-            "V5.12 sample count must be a positive multiple of 3"
+            "样本数量必须是大于 0 的 3 的倍数"
         )
 
     seeds = tuple(
         (
             LOOKAHEAD_SEED_BASE
-            + stage * 1000003
+            + pass_index * 1000003
             + i * 9176
         ) & ((1 << 63) - 1)
         for i in range(count)
     )
 
-    return V512SamplePlan(
-        stage=stage,
+    return SamplingPlan(
+        pass_index=pass_index,
         seeds=seeds,
     )
 
 
 
-def make_v512_stage_plan(stage):
-    """根据 stage 创建唯一的 V5.12 SamplePlan。"""
-    stage = int(stage)
-    if stage == 1:
-        count = 6
-    elif stage == 2:
-        count = 9
-    else:
-        raise ValueError(f"unsupported V5.12 stage: {stage}")
+def make_evaluation_plan(pass_index):
+    """根据评估轮次创建对应的采样计划。"""
+    pass_index = int(pass_index)
+    if pass_index != 2:
+        raise ValueError(f"不支持的评估轮次：{pass_index}")
 
-    return make_v512_sample_plan(stage, count)
+    count = FINAL_SAMPLE_COUNT
+
+    return make_sampling_plan(pass_index, count)
 
 
-
-
-V512_BALANCED_TYPES = ("f", "r", "w")
 
 
 def _balanced_type_for_sample(
@@ -3382,7 +3128,7 @@ def _balanced_type_for_sample(
     sample_plan,
 ):
     """
-    V5.12 独立变量分层采样。
+    对每个补球位置进行独立且均衡的分层采样。
 
     关键修正：
         不再使用：
@@ -3407,41 +3153,27 @@ def _balanced_type_for_sample(
 
     对超过 2 个变量的情况，使用有限样本下的循环平衡设计。
     """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError("sample_plan must be V512SamplePlan")
+    if not isinstance(sample_plan, SamplingPlan):
+        raise TypeError("sample_plan 必须是 SamplingPlan")
 
     count = sample_plan.count
     if count <= 0 or count % 3 != 0:
         raise ValueError(
-            f"V5.12 sample count must be a positive multiple of 3: {count}"
+            f"样本数量必须是大于 0 的 3 的倍数：{count}"
         )
 
     sample_index = int(sample_index)
     empty_index = int(empty_index)
 
     if not 0 <= sample_index < count:
-        raise IndexError("sample_index outside SamplePlan")
+        raise IndexError("样本索引超出采样计划范围")
 
     if empty_index < 0:
-        raise IndexError("empty_index must be >= 0")
+        raise IndexError("空位索引必须大于等于 0")
 
     colors = ("f", "r", "w")
 
-    # --------------------------------------------------------
-    # 9 samples：两个变量做完整 3×3 枚举。
-    #
-    # sample:
-    #   0 1 2 3 4 5 6 7 8
-    # var0:
-    #   f f f r r r w w w
-    # var1:
-    #   f r w f r w f r w
-    #
-    # 因而：
-    #   P(var0=f,var1=r) = 1/9
-    #   P(var0=r) = 1/3
-    #   P(var1=w) = 1/3
-    # --------------------------------------------------------
+    # 9 个样本时，前两个补球位置完整覆盖 3×3 种颜色组合。
     if count == 9:
         a = sample_index // 3
         b = sample_index % 3
@@ -3451,31 +3183,21 @@ def _balanced_type_for_sample(
         elif empty_index == 1:
             digit = b
         else:
-            # 后续变量使用独立的拉丁方设计，保证单变量仍为 1/3，
-            # 并尽量避免与前两个变量形成固定相位关系。
-            # 对 empty_index=2：f,r,w 在每个 row/column 中均衡。
+            # 后续位置使用拉丁方设计，保持单个位置的颜色分布均衡。
             digit = (a + b) % 3
             if empty_index >= 3:
                 digit = (a + (empty_index - 1) * b) % 3
 
         return colors[digit]
 
-    # --------------------------------------------------------
-    # 6 samples：无法完整覆盖两个三值变量的 9 种组合。
-    # 使用“块 + 相位”设计，使每个具体空位仍然 f/r/w 各 2 次，
-    # 同时不采用简单 empty_index 相位绑定。
-    # --------------------------------------------------------
     if count == 6:
-        # 前 3 个样本和后 3 个样本分别覆盖 f/r/w。
-        # 不同空位使用不同的拉丁排列。
+        # 6 个样本无法覆盖全部 9 种组合，但每个位置仍各出现 2 次。
         block = sample_index // 3
         pos = sample_index % 3
         digit = (pos + block * empty_index) % 3
         return colors[digit]
 
-    # --------------------------------------------------------
-    # 通用情况：每个具体变量独立做均衡循环。
-    # --------------------------------------------------------
+    # 其他样本数使用独立的均衡循环。
     return colors[
         (sample_index + empty_index * (sample_index // 3 + 1)) % 3
     ]
@@ -3483,53 +3205,15 @@ def _balanced_type_for_sample(
 
 
 
-def _make_balanced_refill_board(
-    board,
-    sample_index,
-    sample_plan,
-):
-    """
-    根据统一 SamplePlan 构造一个完整随机补球世界。
-    """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError(
-            "sample_plan must be V512SamplePlan"
-        )
-
-    if not (
-        0 <= int(sample_index) < sample_plan.count
-    ):
-        raise IndexError(
-            "sample_index outside SamplePlan"
-        )
-
-    state = copy_board(board)
-    empties = empty_cells(state)
-
-    for empty_index, (r, c) in enumerate(empties):
-        ball_type = _balanced_type_for_sample(
-            sample_index,
-            empty_index,
-            sample_plan,
-        )
-        state[r][c] = (
-            ball_type,
-            1,
-        )
-
-    return state
-
-
-
-def _validate_v512_plan_balance(
+def _validate_sampling_plan_balance(
     board,
     sample_plan,
 ):
     """
     验证每个空位的边缘分布严格为 1/3。
     """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError("sample_plan must be V512SamplePlan")
+    if not isinstance(sample_plan, SamplingPlan):
+        raise TypeError("sample_plan 必须是 SamplingPlan")
 
     expected = sample_plan.count // 3
     report = []
@@ -3545,7 +3229,7 @@ def _validate_v512_plan_balance(
             )
             if ball_type not in counts:
                 raise AssertionError(
-                    f"invalid V5.12 ball type: {ball_type!r}"
+                    f"无效的能量球类型：{ball_type!r}"
                 )
             counts[ball_type] += 1
 
@@ -3555,8 +3239,8 @@ def _validate_v512_plan_balance(
             "w": expected,
         }:
             raise AssertionError(
-                f"V5.12 balance error at {(r, c)}: "
-                f"{counts}; sample_count={sample_plan.count}"
+                f"位置 {(r, c)} 的采样分布不均衡："
+                f"{counts}；样本数量={sample_plan.count}"
             )
 
         report.append((r, c, counts))
@@ -3565,71 +3249,9 @@ def _validate_v512_plan_balance(
 
 
 
-def _v512_sample_matrix(sample_plan, empty_count):
+class _BalancedRefillRNG:
     """
-    调试用：展示一次补球事件中每个空位的样本颜色。
-    用于确认“自由变量”没有被错误绑定。
-    """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError("sample_plan must be V512SamplePlan")
-
-    return [
-        [
-            _balanced_type_for_sample(
-                sample_index,
-                empty_index,
-                sample_plan,
-            )
-            for empty_index in range(empty_count)
-        ]
-        for sample_index in range(sample_plan.count)
-    ]
-
-
-def _refill_random_stratified(
-    board,
-    rng,
-    sample_index=None,
-    sample_plan=None,
-    forced_first_type=None,
-):
-    """
-    兼容旧调用，但 V5.12 正式路径必须使用 SamplePlan。
-
-    不再接受 seed 列表或 sample_count。
-    """
-    if sample_plan is not None:
-        return _make_balanced_refill_board(
-            board,
-            sample_index,
-            sample_plan,
-        )
-
-    # 仅保留旧接口兼容路径；正式 V5.12 evaluator 不使用它。
-    state = copy_board(board)
-    empties = empty_cells(state)
-
-    for empty_index, (r, c) in enumerate(empties):
-        if (
-            empty_index == 0
-            and forced_first_type in TYPE_ORDER
-        ):
-            ball_type = forced_first_type
-        else:
-            ball_type = rng.choice(TYPE_ORDER)
-
-        state[r][c] = (
-            ball_type,
-            1,
-        )
-
-    return state
-
-
-
-class _V512BalancedRNG:
-    """
-    V5.12 的分层随机补球 RNG。
+    用于分层随机补球的 RNG。
 
     resolve_with_refill() 本身不修改；它仍然调用：
         refill_random(state, rng)
@@ -3637,7 +3259,7 @@ class _V512BalancedRNG:
         rng.choice(TYPE_ORDER)
 
     这里仅替换 choice() 的取样方式：
-    对每一个独立的补球 draw ordinal，跨 SamplePlan 的 samples
+    对每一个独立的补球位置，跨全部样本
     严格 f/r/w 各占 1/3。
 
     sample_index 决定同一 draw 在哪个颜色层；
@@ -3668,8 +3290,7 @@ class _V512BalancedRNG:
         self.draw_index = 0
 
     def choice(self, seq):
-        # refill_random() 的正式调用是 choice(TYPE_ORDER)。
-        # 不依赖 TYPE_ORDER 的顺序，显式返回游戏的 f/r/w。
+        """为补球位置提供均衡颜色，其他序列交给后备 RNG。"""
         try:
             values = tuple(seq)
         except TypeError:
@@ -3710,62 +3331,21 @@ class _V512BalancedRNG:
         return self.fallback.choice(seq)
 
 
-def _v512_fill_initial_empties(
-    board,
-    sample_index,
-    sample_plan,
-    rng,
-):
-    """
-    初次补球也走同一个 BalancedRNG，保证所有 refill draw 都处于
-    同一个 sample 世界，而不是只有第一次补球 balanced。
-    """
-    state = copy_board(board)
-
-    for r, c in empty_cells(state):
-        state[r][c] = (
-            rng.choice(("f", "r", "w")),
-            1,
-        )
-
-    return state
-
-
-
-
-def _v512_stage2_rng(sample_index, sample_plan):
-    """
-    Stage-2 sample-local RNG.
-
-    The same SamplePlan seed is reused for every candidate next swap
-    (common random numbers). Each draw uses the game's TYPE_ORDER through
-    Python's uniform Random.choice, so f/r/w each have probability 1/3.
-    """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError("sample_plan must be V512SamplePlan")
-    return _V512BalancedRNG(
-        sample_plan.seeds[sample_index],
-        sample_index,
-        sample_plan.count,
-    )
-
-
-
 def _simulate_refill_chain_once(
     board_after_current_merge,
     sample_index,
     sample_plan,
 ):
     """
-    One genuine random sample for current post-refill chain.
+    对当前交换后的补球连锁执行一次随机样本模拟。
 
-    board_after_current_merge has already completed all deterministic
-    pre-refill merges. Only gains after the first random refill belong here.
+    传入的棋盘已经完成第一次补球前的确定性合成；这里只统计第一次
+    随机补球之后产生的收益。
     """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError("sample_plan must be V512SamplePlan")
+    if not isinstance(sample_plan, SamplingPlan):
+        raise TypeError("sample_plan 必须是 SamplingPlan")
 
-    rng = _V512BalancedRNG(
+    rng = _BalancedRefillRNG(
         sample_plan.seeds[sample_index],
         sample_index,
     )
@@ -3795,21 +3375,14 @@ def _simulate_next_swap_on_sample(
     sample_plan,
 ):
     """
-    One genuine random sample for a concrete next swap.
+    对一个具体的下一步交换执行一次随机补球模拟。
 
-    next_gain:
-        all deterministic merges after the swap and before the first refill.
-
-    next_chain_gain:
-        all gains beginning with the first random refill and continuing
-        through subsequent real chain resolution.
-
-    This is deliberately N-sample Monte Carlo, matching the original
-    V5.12 requirement. It does NOT enumerate an exponential probability
-    tree and therefore cannot hang on a normal board.
+    ``next_gain`` 是交换后、第一次补球前的确定性合成收益；
+    ``next_chain_gain`` 是第一次补球及其后续连锁产生的收益。
+    评估只使用固定数量的样本，不展开指数级概率树。
     """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError("sample_plan must be V512SamplePlan")
+    if not isinstance(sample_plan, SamplingPlan):
+        raise TypeError("sample_plan 必须是 SamplingPlan")
 
     a = board[p1[0]][p1[1]]
     b = board[p2[0]][p2[1]]
@@ -3822,7 +3395,7 @@ def _simulate_next_swap_on_sample(
     if not find_matches(swapped):
         return None
 
-    # All pre-refill deterministic cascade belongs to next_gain.
+    # 第一次补球前的确定性连锁计入 next_gain。
     next_state, merge_count, next_gain = resolve_merges(
         swapped,
         max_rounds=20,
@@ -3831,9 +3404,9 @@ def _simulate_next_swap_on_sample(
     if merge_count <= 0:
         return None
 
-    # First refill is the boundary: only gains after it are next_chain_gain.
+    # 第一次补球是收益边界，之后的连锁计入 next_chain_gain。
     if empty_cells(next_state):
-        rng = _V512BalancedRNG(
+        rng = _BalancedRefillRNG(
             sample_plan.seeds[sample_index],
             sample_index,
             sample_plan.count,
@@ -3865,27 +3438,22 @@ def _simulate_next_swap_on_sample(
 
 
 
-def _v512_evaluate_candidate_samples(
+def _evaluate_candidate_samples(
     board_after_current_merge,
     sample_plan,
     current_step,
 ):
     """
-    V5.12 唯一核心评估器。
+    评估当前连锁和下一步交换的随机期望。
 
-    SamplePlan -> 每个 sample -> 当前连锁
-    -> 每个具体下一步交换 -> 跨全部 samples 求期望
-    -> 交换之间取最大。
-
-    不存在 seed/list/count 混用。
+    先生成每个样本的当前连锁结果，再比较每个具体下一步交换
+    在全部样本上的平均收益。
     """
-    if not isinstance(sample_plan, V512SamplePlan):
-        raise TypeError(
-            "sample_plan must be V512SamplePlan"
-        )
+    if not isinstance(sample_plan, SamplingPlan):
+            raise TypeError("sample_plan 必须是 SamplingPlan")
 
-    # 审计 balanced sampling。
-    balance_report = _validate_v512_plan_balance(
+    # 验证每个补球位置的颜色分布保持均衡。
+    balance_report = _validate_sampling_plan_balance(
         board_after_current_merge,
         sample_plan,
     )
@@ -3915,10 +3483,29 @@ def _v512_evaluate_candidate_samples(
         current_chain_values
     )
 
-    # 下一步交换收益期望：
-    # 对同一个具体交换，在全部 sample 上计算“交换后、首次补球前”
-    # 的确定性真实收益；无法形成合成的 sample 记 0。
-    # 因此分母永远固定为 sample_plan.count。
+    # 第 20 步已经是最后一步：保留当前交换及其连锁收益，
+    # 不再模拟下一次补球和下一步交换，避免把不存在的收益计入评分。
+    if current_step >= TOTAL_GAME_MOVES:
+        return {
+            "current_chain_gain": float(current_chain_expected),
+            "current_chain_samples": current_chain_values,
+            "current_sample_count": sample_plan.count,
+            "sample_plan": sample_plan,
+            "balance_report": balance_report,
+            "next_gain": 0.0,
+            "next_chain_gain": 0.0,
+            "future_gain": 0.0,
+            "potential": 0.0,
+            "next_p1": None,
+            "next_p2": None,
+            "next_gain_samples": [],
+            "next_chain_samples": [],
+            "next_legal_count": 0,
+            "lookahead_enabled": False,
+        }
+
+    # 对同一个具体交换，在全部样本上计算“交换后、首次补球前”的
+    # 确定性真实收益；无法形成合成的样本记为 0，分母始终固定。
     per_swap = {}
     all_swap_keys = set()
 
@@ -3943,6 +3530,7 @@ def _v512_evaluate_candidate_samples(
             "next_gain_samples": [],
             "next_chain_samples": [],
             "next_legal_count": 0,
+            "lookahead_enabled": True,
         }
 
     for swap_key in all_swap_keys:
@@ -3979,7 +3567,7 @@ def _v512_evaluate_candidate_samples(
     best = None
 
     for swap_key, values in per_swap.items():
-        # 固定全部 N 个样本求平均，这就是下一步交换收益期望。
+        # 固定全部样本求平均，得到下一步交换收益期望。
         next_gain_samples = [
             float(v["next_gain"]) for v in values
         ]
@@ -4017,10 +3605,10 @@ def _v512_evaluate_candidate_samples(
         "sample_plan": sample_plan,
         "balance_report": balance_report,
 
-        # 最终评分只使用这个“下一步直接交换收益期望”。
+        # 最终评分只使用“下一步直接交换收益期望”。
         "next_gain": float(best["next_gain"]),
 
-        # 兼容旧字段，但不再参与评分。
+        # 该字段保留在统一结果结构中，但不参与评分。
         "next_chain_gain": 0.0,
         "future_gain": float(best["next_gain"]),
 
@@ -4030,222 +3618,206 @@ def _v512_evaluate_candidate_samples(
         "next_gain_samples": list(best["next_gain_samples"]),
         "next_chain_samples": [],
         "next_legal_count": int(best["legal_count"]),
+        "lookahead_enabled": True,
     }
 
 
 
-def evaluate_future_once(
-    board,
-    sample_index,
-    sample_plan,
-    current_step=1,
-):
+def analyze_all_swaps(board, *args, **kwargs):
     """
-    单 sample 兼容接口。
-    正式路径仍由统一 SamplePlan 管理。
-    """
-    state, current_chain_gain = (
-        _simulate_refill_chain_once(
-            board,
-            sample_index,
-            sample_plan,
-        )
-    )
+    在全部 351 种交换中选择当前最优方案。
 
-    outcomes = {}
-
-    for p1, p2 in _future_legal_swaps(state):
-        outcome = _simulate_next_swap_on_sample(
-            state,
-            p1,
-            p2,
-            sample_index,
-            sample_plan,
-        )
-
-        if outcome is not None:
-            outcomes[(p1, p2)] = outcome
-
-    return {
-        "current_chain_gain": float(
-            current_chain_gain
-        ),
-        "outcomes": outcomes,
-    }
-
-
-def evaluate_future_expected(
-    board,
-    sample_plan,
-    current_step=1,
-):
-    """统一 SamplePlan 的期望前瞻接口。"""
-    return _v512_evaluate_candidate_samples(
-        board,
-        sample_plan,
-        current_step,
-    )
-
-
-
-def analyze_all_swaps_v50_1(board, *args, **kwargs):
-    """
-    V5.12-fixed2-fixed：
-
-    351 个当前交换
-      -> Top 30
-      -> 6 个 balanced samples
-      -> Top 6
-      -> 9 个 balanced samples 重新计算
-      -> 最终排序
+    流程：
+      351 种交换 -> 快速筛选前 12 名
+      -> 9 个均衡随机样本统一评估 -> 最终排序
 
     当前连锁：
-      mean(每个随机样本的真实连锁收益)
+      每个随机样本的真实连锁收益平均值
 
     下一步：
       对每个具体交换跨全部随机样本求期望，
       然后选择期望最高的交换。
 
     最终评分：
-      CurrentGain + FutureGain
+      当前收益 + 下一步收益期望
 
-    board_potential 只显示，不进入评分。
+    局面潜力只显示，不进入评分。
     """
     t0 = time.perf_counter()
     current_step = int(kwargs.get("current_step", 1))
 
-    def evaluate_stage(candidates, sample_plan):
+    def evaluate_candidates(candidates, sample_plan):
         if not candidates:
             return []
 
         if not isinstance(
             sample_plan,
-            V512SamplePlan,
+            SamplingPlan,
         ):
-            raise TypeError(
-                "evaluate_stage requires V512SamplePlan"
-            )
+            raise TypeError("候选评估需要 SamplingPlan")
 
         results = []
+        pending = []
+        evaluated = {}
 
-        for index, result in enumerate(candidates, 1):
-            if STOP_EVENT.is_set() or AUTO_STOP_REQUESTED:
-                # 正常停止：返回已完成的部分结果。
-                # 外层 run_auto_loop_v43 会再次检查停止状态，
-                # 因而不会误执行交换。
-                break
+        # 每个候选只读自己的棋盘副本，先并行完成随机评估；
+        # 缓存和统计仍由主线程处理，避免并发写入全局状态。
+        executor = None
+        try:
+            for index, result in enumerate(candidates, 1):
+                if STOP_EVENT.is_set() or AUTO_STOP_REQUESTED:
+                    break
 
-            b2 = result.get("board")
-            if b2 is None:
-                results.append(result)
-                continue
+                b2 = result.get("board")
+                if b2 is None:
+                    evaluated[index] = (result, None)
+                    continue
 
-            # 缓存的是“这个候选棋盘 + 这批 seeds”对应的完整统计，
-            # 不再缓存一个被误解为期望的单一路径结果。
-            cache_key = (
-                "v512_unified_sampling",
-                _v53_board_key(b2),
-                sample_plan.stage,
-                sample_plan.seeds,
-            )
-
-            if cache_key in SWAP_EVAL_CACHE:
-                V53_STATS["cache_hits"] += 1
-                future = SWAP_EVAL_CACHE[cache_key]
-            else:
-                V53_STATS["cache_misses"] += 1
-
-                future = _v512_evaluate_candidate_samples(
-                    b2,
-                    sample_plan,
-                    current_step,
+                cache_key = (
+                    "balanced_sampling",
+                    _board_cache_key(b2),
+                    sample_plan.pass_index,
+                    sample_plan.seeds,
+                    current_step < TOTAL_GAME_MOVES,
                 )
 
-                SWAP_EVAL_CACHE[cache_key] = future
-                V53_STATS["future_simulations"] += (
-                    sample_plan.count
+                if cache_key in SWAP_EVAL_CACHE:
+                    SEARCH_STATS["cache_hits"] += 1
+                    evaluated[index] = (
+                        result,
+                        SWAP_EVAL_CACHE[cache_key],
+                    )
+                else:
+                    SEARCH_STATS["cache_misses"] += 1
+                    pending.append((index, result, cache_key))
+
+            if pending:
+                worker_count = min(
+                    EVALUATION_WORKERS,
+                    len(pending),
+                )
+                executor = ThreadPoolExecutor(
+                    max_workers=worker_count
                 )
 
-            r = dict(result)
+                for index, result, cache_key in pending:
+                    evaluated[index] = (
+                        result,
+                        executor.submit(
+                            _evaluate_candidate_samples,
+                            result["board"],
+                            sample_plan,
+                            current_step,
+                        ),
+                        cache_key,
+                    )
 
-            r["current_chain_gain"] = float(
-                future["current_chain_gain"]
-            )
+            for index, result in enumerate(candidates, 1):
+                if index not in evaluated:
+                    break
 
-            # V5.12-fixed2-fixed 审计字段：这些是同一批 seeds 的逐样本真实结果，
-            # current_chain_gain 本身则是它们的 mean。
-            r["current_chain_samples"] = list(
-                future.get("current_chain_samples", [])
-            )
-            r["current_sample_count"] = int(
-                future.get(
-                    "current_sample_count",
-                    sample_plan.count,
+                item = evaluated[index]
+                if item[1] is None:
+                    results.append(result)
+                    continue
+
+                future = item[1]
+                if hasattr(future, "result"):
+                    future = future.result()
+                    SWAP_EVAL_CACHE[item[2]] = future
+                    SEARCH_STATS["future_simulations"] += (
+                        sample_plan.count
+                    )
+
+                r = dict(result)
+
+                r["current_chain_gain"] = float(
+                    future["current_chain_gain"]
                 )
-            )
-            r["sample_plan_stage"] = int(
-                sample_plan.stage
-            )
-            r["next_gain_samples"] = list(
-                future.get("next_gain_samples", [])
-            )
-            r["next_chain_samples"] = list(
-                future.get("next_chain_samples", [])
-            )
 
-            r["current_gain"] = (
-                r["immediate_gain"]
-                + r["current_chain_gain"]
-            )
+                # 保留逐样本结果，便于检查平均收益的来源。
+                r["current_chain_samples"] = list(
+                    future.get("current_chain_samples", [])
+                )
+                r["current_sample_count"] = int(
+                    future.get(
+                        "current_sample_count",
+                        sample_plan.count,
+                    )
+                )
+                r["sample_pass"] = int(
+                    sample_plan.pass_index
+                )
+                r["next_gain_samples"] = list(
+                    future.get("next_gain_samples", [])
+                )
+                r["next_chain_samples"] = list(
+                    future.get("next_chain_samples", [])
+                )
 
-            r["next_gain"] = float(
-                future["next_gain"]
-            )
+                r["current_gain"] = (
+                    r["immediate_gain"]
+                    + r["current_chain_gain"]
+                )
 
-            r["next_chain_gain"] = float(
-                future["next_chain_gain"]
-            )
+                r["next_gain"] = float(
+                    future["next_gain"]
+                )
 
-            r["future_gain"] = float(
-                future["future_gain"]
-            )
+                r["next_chain_gain"] = float(
+                    future["next_chain_gain"]
+                )
 
-            r["potential"] = float(
-                future["potential"]
-            )
+                r["future_gain"] = float(
+                    future["future_gain"]
+                )
 
-            r["next_p1"] = future["next_p1"]
-            r["next_p2"] = future["next_p2"]
+                r["potential"] = float(
+                    future["potential"]
+                )
 
-            # 兼容旧字段。
-            r["chain_gain"] = r["current_chain_gain"]
-            r["second_expected"] = r["next_gain"]
-            r["chain_value"] = r["current_chain_gain"]
-            r["future_potential"] = r["potential"]
+                r["next_p1"] = future["next_p1"]
+                r["next_p2"] = future["next_p2"]
+                r["lookahead_enabled"] = bool(
+                    future.get("lookahead_enabled", True)
+                )
 
-            # 最终评分：
-            # CurrentGain = 当前交换收益 + 当前交换后连锁期望
-            # FinalScore  = CurrentGain + 下一步交换收益期望
-            # 下一步交换后的连锁收益不参与评分。
-            r["real_score"] = (
-                r["current_gain"]
-                + r["next_gain"]
-            )
+                # 统一结果结构中的补充字段。
+                r["chain_gain"] = r["current_chain_gain"]
+                r["second_expected"] = r["next_gain"]
+                r["chain_value"] = r["current_chain_gain"]
+                r["future_potential"] = r["potential"]
 
-            # board_potential 不再换算成能量。
-            r["potential_bonus"] = 0.0
-            r["final_score"] = r["real_score"]
-            r["future_score"] = r["final_score"]
-            r["score"] = r["final_score"]
+                # 最终评分 = 当前交换收益 + 当前交换后连锁期望
+                #           + 下一步交换收益期望。
+                # 下一步交换后的连锁收益不参与评分。
+                lookahead_gain = (
+                    r["next_gain"]
+                    if r.get("lookahead_enabled", True)
+                    else 0.0
+                )
+                r["real_score"] = (
+                    r["current_gain"]
+                    + lookahead_gain
+                )
 
-            assert_candidate(r)
-            results.append(r)
+                # 局面潜力不换算成能量。
+                r["potential_bonus"] = 0.0
+                r["final_score"] = r["real_score"]
+                r["future_score"] = r["final_score"]
+                r["score"] = r["final_score"]
 
-            print(
-                f"\r{index}/{len(candidates)}",
-                end="",
-                flush=True
-            )
+                assert_candidate(r)
+                results.append(r)
+
+                print(
+                    f"\r{index}/{len(candidates)}",
+                    end="",
+                    flush=True
+                )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         print()
 
@@ -4257,18 +3829,17 @@ def analyze_all_swaps_v50_1(board, *args, **kwargs):
 
         return results
 
-    # --------------------------------------------------------
-    # Stage 1：351 -> Top 30
-    # --------------------------------------------------------
+    # 快速筛选全部 351 种交换，保留前 12 名。
+    quick_start = time.perf_counter()
     quick = []
 
     for p1, p2 in generate_all_swaps():
         try:
             result = evaluate_swap(board, p1, p2)
         except Exception as exc:
-            if V53_BENCHMARK:
+            if PRINT_SEARCH_BENCHMARK:
                 print(
-                    f"V5.12 evaluate_swap error "
+                    f"交换评估出错 "
                     f"{p1}<->{p2}: {exc!r}"
                 )
             continue
@@ -4287,12 +3858,12 @@ def analyze_all_swaps_v50_1(board, *args, **kwargs):
         assert_candidate(result)
         quick.append(result)
 
-    V53_STATS["quick_candidates"] += len(quick)
+    SEARCH_STATS["quick_candidates"] += len(quick)
 
     if not quick:
-        if V53_BENCHMARK:
+        if PRINT_SEARCH_BENCHMARK:
             print(
-                "V5.12 调试：Stage 1 quick=0；"
+                "调试：快速筛选结果为空；"
                 "请检查 evaluate_swap / make_candidate。"
             )
         return []
@@ -4308,78 +3879,59 @@ def analyze_all_swaps_v50_1(board, *args, **kwargs):
         reverse=True
     )
 
-    quick = _v53_unique_fast(quick)
-    quick = quick[:V53_FAST_FILTER_TOP]
+    quick = _unique_swap_candidates(quick)
+    quick = quick[:FAST_FILTER_LIMIT]
+    quick_elapsed = time.perf_counter() - quick_start
 
-    # --------------------------------------------------------
-    # Stage 2：6 个 balanced samples
-    # --------------------------------------------------------
-    stage2 = evaluate_stage(
+    # 对全部快速筛选候选统一使用 9 个均衡样本评估。
+    final_start = time.perf_counter()
+    final = evaluate_candidates(
         quick,
-        make_v512_stage_plan(1),
+        make_evaluation_plan(2),
     )
+    final_elapsed = time.perf_counter() - final_start
 
-    stage2 = stage2[:V53_DEEP_TOP]
-
-    # --------------------------------------------------------
-    # Stage 3：9 个 balanced samples 重新计算
-    # --------------------------------------------------------
-    final = evaluate_stage(
-        stage2,
-        make_v512_stage_plan(2),
-    )
-
-    if len(SWAP_EVAL_CACHE) > V53_CACHE_MAX:
-        while len(SWAP_EVAL_CACHE) > V53_CACHE_MAX:
+    if len(SWAP_EVAL_CACHE) > EVALUATION_CACHE_LIMIT:
+        while len(SWAP_EVAL_CACHE) > EVALUATION_CACHE_LIMIT:
             SWAP_EVAL_CACHE.pop(
                 next(iter(SWAP_EVAL_CACHE))
             )
 
-    if V53_BENCHMARK:
+    if PRINT_SEARCH_BENCHMARK:
         elapsed = time.perf_counter() - t0
         print(
-            f"[V5.12-fixed2-fixed benchmark] 351 -> {len(quick)} -> "
-            f"{len(stage2)} | "
-            f"samples={V512_STAGE2_SAMPLE_COUNT}+"
-            f"{V512_STAGE3_SAMPLE_COUNT} "
-            f"cache_hit={V53_STATS['cache_hits']} "
-            f"time={elapsed:.3f}s"
+            f"[搜索] 351 -> {len(quick)} | "
+            f"样本={FINAL_SAMPLE_COUNT} | "
+            f"线程={EVALUATION_WORKERS} | "
+            f"快速筛选={quick_elapsed:.3f}s | "
+            f"最终评估={final_elapsed:.3f}s | "
+            f"缓存命中={SEARCH_STATS['cache_hits']} | "
+            f"总耗时={elapsed:.3f}s"
         )
-
     return final
 
 
 
-def explain_score_components(result):
-    """
-    V5.12-fixed2-fixed 离线检查辅助：
-      CurrentGain = 当前交换收益 + 当前交换后连锁期望
-      FinalScore  = CurrentGain + 下一步交换收益期望
+def save_swap_results(results, step):
+    """将完整候选筛选结果保存到 DEBUG 文本文件，不刷屏终端。"""
+    if not DEBUG_SAVE_IMAGES:
+        return
 
-    下一步交换后的连锁收益不参与最终评分。
-    board_potential 不参与最终能量评分。
-    """
-    immediate = float(result.get("immediate_gain", 0.0))
-    current_chain = float(result.get("current_chain_gain", 0.0))
-    next_gain = float(result.get("next_gain", 0.0))
+    os.makedirs(SEARCH_DEBUG_DIR, exist_ok=True)
 
-    current_gain = immediate + current_chain
-    final_score = current_gain + next_gain
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        print_swap_results(results)
 
-    return {
-        "current_gain": current_gain,
-        "next_gain": next_gain,
-        "final_score": final_score,
-    }
+    output_path = os.path.join(
+        SEARCH_DEBUG_DIR,
+        f"search_step_{step:02d}.txt",
+    )
+    with open(output_path, "w", encoding="utf-8") as file:
+        file.write(output.getvalue())
 
 
-
-def benchmark_swap_count():
-    """离线 sanity check：3×9 棋盘任意两格交换必须是 351。"""
-    return len(generate_all_swaps())
-
-
-def print_swap_results_v50_1(results):
+def print_swap_results(results):
     print()
     print("=" * 120)
     print("筛选结果")
@@ -4389,7 +3941,11 @@ def print_swap_results_v50_1(results):
         print("当前没有找到有效交换。")
         return
 
-    for i, result in enumerate(results[:12], 1):
+    # 输出全部快速筛选后进入最终评估的候选。
+    for i, result in enumerate(
+        results[:FAST_FILTER_LIMIT],
+        1,
+    ):
         print(
             f"{i}. {position_name(result['p1'])} <-> "
             f"{position_name(result['p2'])}"
@@ -4400,62 +3956,60 @@ def print_swap_results_v50_1(results):
             f"{result.get('immediate_gain', 0.0):.2f}"
         )
 
-        print(
-            f"   当前交换后连锁期望 = "
-            f"{result.get('current_chain_gain', 0.0):.2f}"
-        )
-
         current_samples = result.get("current_chain_samples", [])
         current_sample_count = result.get(
             "current_sample_count",
             len(current_samples),
         )
-        current_strata = result.get("current_chain_strata", {})
+
         if current_samples:
             print(
-                f"   当前连锁样本（{current_sample_count}个） = "
+                "   当前连锁样本：平均="
+                + f"{statistics.fmean(current_samples):.2f} | "
                 + ", ".join(f"{x:.2f}" for x in current_samples)
-                + " | mean="
-                + f"{statistics.fmean(current_samples):.2f}"
+                + f" ({current_sample_count}个)"
             )
 
         print(
-            f"   CurrentGain = "
+            f"   当前完整收益 = "
             f"{result.get('current_gain', 0.0):.2f}"
         )
 
-        next_p1 = result.get("next_p1")
-        next_p2 = result.get("next_p2")
+        if result.get("lookahead_enabled", True):
+            next_p1 = result.get("next_p1")
+            next_p2 = result.get("next_p2")
 
-        if next_p1 is not None and next_p2 is not None:
-            next_swap_text = (
-                f"{position_name(next_p1)} <-> "
-                f"{position_name(next_p2)}"
-            )
-        else:
-            next_swap_text = "无"
-
-        print(
-            f"   下一步期望最优交换 = {next_swap_text}"
-        )
-
-        print(
-            f"   下一步交换收益期望 = "
-            f"{result.get('next_gain', 0.0):.2f}"
-        )
-
-        legal_counts = result.get("next_legal_counts", {})
-        if legal_counts:
-            print(
-                "   下一步交换分层可用样本 = "
-                + ", ".join(
-                    f"{t}:{legal_counts.get(t, 0)}"
-                    for t in TYPE_ORDER
+            if next_p1 is not None and next_p2 is not None:
+                next_swap_text = (
+                    f"{position_name(next_p1)} <-> "
+                    f"{position_name(next_p2)}"
                 )
+            else:
+                next_swap_text = "无"
+
+            print(
+                f"   下一步期望最优交换 = {next_swap_text}"
             )
 
+            print(
+                f"   下一步交换收益期望 = "
+                f"{result.get('next_gain', 0.0):.2f}"
+            )
+
+            legal_counts = result.get("next_legal_counts", {})
+            if legal_counts:
+                print(
+                    "   下一步交换分层可用样本 = "
+                    + ", ".join(
+                        f"{t}:{legal_counts.get(t, 0)}"
+                        for t in TYPE_ORDER
+                    )
+                )
+        else:
+            print("   已到最后一步，最终评分不计入下一步交换收益期望")
+
         print(
-            f"   board_potential = "
+            f"   局面潜力 = "
             f"{result.get('potential', 0.0):.2f} | "
             f"仅作辅助，不计入最终能量评分"
         )
@@ -4493,40 +4047,38 @@ def print_best_swap(results):
         f"当前交换收益："
         f"{best.get('immediate_gain', 0.0):.2f}"
     )
-    print(
-        f"当前交换后连锁期望："
-        f"{best.get('current_chain_gain', 0.0):.2f}"
-    )
-
     current_samples = best.get("current_chain_samples", [])
     if current_samples:
         print(
             f"当前连锁样本（{len(current_samples)}个）："
             + ", ".join(f"{x:.2f}" for x in current_samples)
-            + " | mean="
+            + " | 平均="
             + f"{statistics.fmean(current_samples):.2f}"
         )
 
     print(
-        f"当前完整收益 CurrentGain："
+        f"当前完整收益："
         f"{best.get('current_gain', 0.0):.2f}"
     )
 
-    next_p1 = best.get("next_p1")
-    next_p2 = best.get("next_p2")
+    if best.get("lookahead_enabled", True):
+        next_p1 = best.get("next_p1")
+        next_p2 = best.get("next_p2")
 
-    if next_p1 is not None and next_p2 is not None:
+        if next_p1 is not None and next_p2 is not None:
+            print(
+                "下一步期望最优交换："
+                f"{position_name(next_p1)} <-> {position_name(next_p2)}"
+            )
+
         print(
-            "下一步期望最优交换："
-            f"{position_name(next_p1)} <-> {position_name(next_p2)}"
+            f"下一步交换收益期望："
+            f"{best.get('next_gain', 0.0):.2f}"
         )
-
+    else:
+        print("已到最后一步，最终评分不计入下一步交换收益期望")
     print(
-        f"下一步交换收益期望："
-        f"{best.get('next_gain', 0.0):.2f}"
-    )
-    print(
-        f"board_potential（仅辅助）："
+        f"局面潜力（仅辅助）："
         f"{best.get('potential', 0.0):.2f}"
     )
     print(
@@ -4545,60 +4097,40 @@ def print_best_swap(results):
 
 
 
-def analyze_board_v40(board, x1, y1, dx, dy):
-    board_state = make_board_state(board)
-
-    print_board_state(board_state)
-
-    results = analyze_all_swaps_v50_1(
-        board_state,
-        current_step=1
-    )
-
-    print_swap_results(
-        results
-    )
-
-    print_best_swap(
-        results
-    )
-
-    if results:
-        print_simulated_board(
-            results[0]
-        )
-    click_best_swap_v43(results, x1, y1, dx, dy)
-
-    return results
-
-
 def main():
+    """完成热键注册、棋盘校准、初始识别和自动交换。"""
+
+    global AUTO_PAUSED
+    global AUTO_STOP_REQUESTED
+
+    AUTO_PAUSED = False
+    AUTO_STOP_REQUESTED = False
+    STOP_EVENT.clear()
+    setup_hotkeys()
 
     print()
     print("=" * 90)
-    print("三打白骨精")
+    print("三打白骨精 项目地址:https://github.com/Fylxom/ZmxyUnpack/releases/tag/1")
     print("=" * 90)
 
     print()
     print("F8：暂停 / 继续")
     print("F9：退出")
 
-    # ========================================================
-    # DEBUG
-    # ========================================================
-
+    # 只有启用 DEBUG 时才创建根目录。
     if DEBUG_SAVE_IMAGES:
         os.makedirs(
             DEBUG_DIR,
             exist_ok=True
         )
 
-    # ========================================================
-    # 校准
-    # ========================================================
+    calibration = calibrate()
 
-    x1, y1, dx, dy = \
-        calibrate()
+    if calibration is None or AUTO_STOP_REQUESTED:
+        print("收到停止指令，程序结束。")
+        return
+
+    x1, y1, dx, dy = calibration
 
 
     cell_w = abs(dx) * 0.90
@@ -4615,10 +4147,7 @@ def main():
     )
 
 
-    # ========================================================
-    # 准备截图
-    # ========================================================
-
+    # 等待用户确认游戏画面已经准备好。
     print()
     print(
         "准备好后按 Enter 开始..."
@@ -4626,210 +4155,51 @@ def main():
 
     input()
 
+    wait_while_paused()
 
-    # ========================================================
-    # MSS
-    # ========================================================
+    if AUTO_STOP_REQUESTED:
+        print("收到停止指令，程序结束。")
+        return
 
+    # 用 MSS 连续截取屏幕，等待完整棋盘稳定出现。
     with mss.MSS() as sct:
 
-        monitor = sct.monitors[0]
-
-        raw = np.array(
-            sct.grab(
-                monitor
-            )
+        full_monitor = sct.monitors[0]
+        monitor = get_board_capture_monitor(
+            x1,
+            y1,
+            dx,
+            dy,
+            full_monitor,
         )
 
-
-    screenshot = cv2.cvtColor(
-        raw,
-        cv2.COLOR_BGRA2BGR
-    )
-
-
-    # ========================================================
-    # 保存原始截图
-    # ========================================================
-
-    if DEBUG_SAVE_IMAGES:
-        cv2.imwrite(
-        os.path.join(
-            DEBUG_DIR,
-            "screen.png"
-        ),
-        screenshot
-    )
-
-
-    board = []
-
-    detailed = []
-
-
-    # ========================================================
-    # 逐格识别
-    # ========================================================
-
-    for row in range(ROWS):
-
-        board_row = []
-
-        detail_row = []
-
-
-        for col in range(COLS):
-
-            cx = (
-
-                x1 +
-                col * dx
-            )
-
-
-            cy = (
-
-                y1 +
-                row * dy
-            )
-
-
-            cell = crop_cell(
-                screenshot,
-                cx,
-                cy,
-                cell_w,
-                cell_h
-            )
-
-
-            if cell is None:
-
-                result = {
-
-                    "type": "?",
-
-                    "level": 0,
-
-                    "area_ratio": 0,
-
-                    "width_ratio": 0,
-
-                    "height_ratio": 0,
-
-                    "diameter": 0,
-
-                    "confidence": 0
-                }
-
-
-                data = {}
-
-
-            else:
-
-                result, data = \
-                    recognize_cell(
-
-                        cell,
-
-                        row,
-
-                        col,
-
-                        DEBUG_DIR
-                    )
-
-
-            board_row.append(
-                result
-            )
-
-
-            detail_row.append(
-                (
-                    result,
-                    data
-                )
-            )
-
-
-        board.append(
-            board_row
+        print()
+        initial_result = wait_for_initial_board_ready(
+            sct,
+            monitor,
+            x1,
+            y1,
+            dx,
+            dy
         )
 
+        if initial_result is None:
+            print("收到停止指令，程序结束。")
+            return
 
-        detailed.append(
-            detail_row
-        )
+        _, capture_x1, capture_y1, dx, dy = initial_result
+        x1 = capture_x1 + monitor["left"]
+        y1 = capture_y1 + monitor["top"]
+
+        print("初始棋盘已稳定，开始截图...")
 
 
-# ========================================================
-    # 绘制最终结果
-    # ========================================================
-
-    result_img = screenshot.copy()
-
-    for row in range(ROWS):
-        for col in range(COLS):
-            result = board[row][col]
-
-            cx = int(round(x1 + col * dx))
-            cy = int(round(y1 + row * dy))
-
-            t = result["type"]
-            color = DRAW_COLOR[t]
-
-            half_w = int(cell_w / 2)
-            half_h = int(cell_h / 2)
-
-            cv2.rectangle(
-                result_img,
-                (cx - half_w, cy - half_h),
-                (cx + half_w, cy + half_h),
-                color,
-                2
-            )
-
-            cv2.circle(
-                result_img,
-                (cx, cy),
-                3,
-                (0, 255, 0),
-                -1
-            )
-
-            text = (
-                f"{result['level']}{t}"
-                if t != "?"
-                else "?"
-            )
-
-            cv2.putText(
-                result_img,
-                text,
-                (cx - 15, cy - half_h + 18),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-                cv2.LINE_AA
-            )
-
-    # ========================================================
-    # 自动运行
-    # ========================================================
-
-    run_auto_loop_v43(
+    run_auto_loop(
         x1,
         y1,
         dx,
         dy
     )
-
-    # ========================================================
-    # 完成
-    # ========================================================
 
     print()
     print("=" * 90)
@@ -4839,10 +4209,6 @@ def main():
     print()
     print(f"调试目录：{os.path.abspath(DEBUG_DIR)}")
 
-
-# ============================================================
-# 程序入口
-# ============================================================
 
 if __name__ == "__main__":
     try:
@@ -4865,3 +4231,6 @@ if __name__ == "__main__":
 
         print()
         input("按 Enter 退出...")
+
+    finally:
+        finish_debug_writer()
