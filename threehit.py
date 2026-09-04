@@ -50,8 +50,8 @@ COLS = 9
 # 按当前棋盘截图 862×288 作为正常尺寸，防止误框选过小区域。
 REFERENCE_BOARD_WIDTH = 862
 REFERENCE_BOARD_HEIGHT = 288
-MIN_BOARD_WIDTH = REFERENCE_BOARD_WIDTH / 2
-MIN_BOARD_HEIGHT = REFERENCE_BOARD_HEIGHT / 2
+MIN_BOARD_WIDTH = REFERENCE_BOARD_WIDTH / 4
+MIN_BOARD_HEIGHT = REFERENCE_BOARD_HEIGHT / 4
 
 DEBUG_DIR = "debug"
 BOARD_DEBUG_DIR = os.path.join(DEBUG_DIR, "board")
@@ -1776,7 +1776,7 @@ def save_board_debug_images(
 def wait_for_initial_board_ready(sct, monitor, x1, y1, dx, dy):
     """等待 27 个球全部识别成功且棋盘状态稳定后返回截图。"""
 
-    print("等待能量球出现...", end="", flush=True)
+    print("等待能量球出现...(按F7可重新选择区域)", end="", flush=True)
 
     capture_x1, capture_y1 = get_capture_board_origin(
         x1,
@@ -2350,7 +2350,7 @@ def run_auto_loop(
                 if debug_step_count >= TOTAL_GAME_MOVES:
                     move_count -= 1
                     request_auto_stop(
-                        "已完成 20 步，棋盘仍有未识别能量球，自动执行 F9"
+                        "已完成 20 步，自动退出"
                     )
                     break
 
@@ -2624,6 +2624,37 @@ BALL_ENERGY = {
 
 TYPE_ORDER = ("f", "r", "w")
 
+
+def ball_energy_value(ball):
+    """返回一个能量球当前占用的能量价值。"""
+    if ball is None:
+        return 0.0
+
+    ball_type, level = ball
+    return float(
+        BALL_ENERGY.get(ball_type, {}).get(level, 0.0)
+    )
+
+
+def refill_energy_gain(empty_positions, board):
+    """计算指定空位补入新球后增加的能量价值。"""
+    return sum(
+        ball_energy_value(board[r][c])
+        for r, c in empty_positions
+        if board[r][c] is not None
+    )
+
+# 三种颜色的全部排列。补球事件会选择不同排列，
+# 但只做颜色重新映射，不改变每个位置的均衡分布。
+COLOR_PERMUTATIONS = (
+    (0, 1, 2),
+    (0, 2, 1),
+    (1, 0, 2),
+    (1, 2, 0),
+    (2, 0, 1),
+    (2, 1, 0),
+)
+
 # 评分参数集中在此，便于统一调整。
 SCORE_WEIGHTS = {
     # 高等级球保留价值
@@ -2714,6 +2745,7 @@ def apply_merge_groups(board, groups):
     """
     同一轮执行所有互不冲突的3球组合。
     每组的生成位置为该组的优先位置。
+    合成收益按净能量计算：新球价值减去三个输入球价值。
     """
     state = copy_board(board)
     gain = 0.0
@@ -2735,13 +2767,18 @@ def apply_merge_groups(board, groups):
 
         ball_type, old_level = ball
         new_level = old_level + 1
+        input_energy = sum(
+            ball_energy_value(state[r][c])
+            for r, c in group
+        )
+        new_energy = ball_energy_value((ball_type, new_level))
 
         for r, c in group:
             state[r][c] = None
 
         state[anchor[0]][anchor[1]] = (ball_type, new_level)
 
-        gain += BALL_ENERGY[ball_type].get(new_level, 0.0)
+        gain += new_energy - input_energy
         merge_count += 1
 
     return state, merge_count, gain
@@ -2820,6 +2857,9 @@ def resolve_with_refill(board, rng, max_rounds=20):
 
     因此，同一次补球之前由升级球立即形成的后续合成，不会被错误
     计入“补球后连锁”之外的阶段。
+
+    返回的 total_gain 使用净能量口径：合成扣除输入球价值，补球加入
+    新生成的1级球价值。
     """
     state = copy_board(board)
     total_gain = 0.0
@@ -2846,8 +2886,10 @@ def resolve_with_refill(board, rng, max_rounds=20):
                 break
             continue
 
-        # 只有确定性合成阶段结束后才进行随机补球。
+        # 只有确定性合成阶段结束后才进行随机补球，并计入新生成球的价值。
+        empty_positions = empty_cells(state)
         state = refill_random(state, rng)
+        total_gain += refill_energy_gain(empty_positions, state)
 
         # 补球后下一轮继续先处理全部确定性合成。
         rounds_used += 1
@@ -2946,7 +2988,10 @@ def evaluate_swap(board, p1, p2):
     immediate_gain = 交换后、第一次随机补球之前，所有连续确定性合成
                      的累计真实收益。
 
-    current_chain_gain = 第一次随机补球之后才产生的真实连锁收益期望。
+    current_chain_gain = 第一次补球价值及其后续真实连锁收益期望。
+
+    合成净收益 = 新球价值 - 三个输入球价值；
+    补球收益 = 新生成的1级球价值。
 
     关键边界：
         交换
@@ -2991,20 +3036,24 @@ def evaluate_swap(board, p1, p2):
     )
 
 
+ALL_SWAPS = tuple(
+    (
+        (r1, c1),
+        (r2, c2),
+    )
+    for r1 in range(ROWS)
+    for c1 in range(COLS)
+    for r2 in range(r1, ROWS)
+    for c2 in range(
+        c1 + 1 if r2 == r1 else 0,
+        COLS,
+    )
+)
+
+
 def generate_all_swaps():
-    swaps = []
-
-    for r1 in range(ROWS):
-        for c1 in range(COLS):
-            p1 = (r1, c1)
-
-            for r2 in range(r1, ROWS):
-                start_c = c1 + 1 if r2 == r1 else 0
-
-                for c2 in range(start_c, COLS):
-                    swaps.append((p1, (r2, c2)))
-
-    return swaps
+    """返回预先生成的全部351种交换组合。"""
+    return ALL_SWAPS
 
 
 
@@ -3095,7 +3144,7 @@ def make_candidate(
         real_score = immediate + future
 
     if final_score is None:
-        final_score = real_score
+        final_score = float(real_score) / 2.0
 
     return {
         "p1": p1,
@@ -3177,7 +3226,7 @@ def assert_candidate(candidate):
 
 
 # 搜索配置。
-# 减少后续随机模拟数量，在速度和搜索范围之间取平衡。
+# 固定保留前12名进行完整样本评估。
 FAST_FILTER_LIMIT = 12
 # 只并行随机评估；截图、识别和点击始终由主线程执行。
 EVALUATION_WORKERS = 8
@@ -3253,9 +3302,12 @@ def make_sampling_plan(pass_index, count):
 
 
 
-def make_evaluation_plan():
-    """创建当前搜索使用的统一采样计划。"""
-    return make_sampling_plan(2, FINAL_SAMPLE_COUNT)
+def make_evaluation_plan(current_step=1):
+    """为当前步创建统一的平衡采样计划。"""
+    return make_sampling_plan(
+        int(current_step),
+        FINAL_SAMPLE_COUNT,
+    )
 
 
 
@@ -3400,26 +3452,37 @@ class _BalancedRefillRNG:
     seed 仅作为非补球随机操作的后备 RNG。
     """
     __slots__ = (
+        "plan_index",
         "sample_index",
         "draw_index",
+        "refill_event_index",
         "fallback",
         "sample_count",
     )
 
-    def __init__(self, seed, sample_index, sample_count=9):
+    def __init__(
+        self,
+        seed,
+        sample_index,
+        sample_count=9,
+        plan_index=0,
+    ):
+        self.plan_index = int(plan_index)
         self.sample_index = int(sample_index)
         self.draw_index = 0
+        self.refill_event_index = 0
         self.fallback = random.Random(seed)
         self.sample_count = int(sample_count)
 
     def begin_refill(self):
         """
-        每一次“补球事件”都从新的独立变量序号 0 开始。
+        每一次“补球事件”都使用新的事件编号，并从变量序号 0 开始。
 
         这非常重要：
         一次补球有两个空位时，它们应该是两个独立随机变量；
         下一次因为连锁又产生空位时，则重新建立新的补球变量组。
         """
+        self.refill_event_index += 1
         self.draw_index = 0
 
     def choice(self, seq):
@@ -3458,8 +3521,19 @@ class _BalancedRefillRNG:
                     + self.draw_index
                 ) % 3
 
+            mixed = (
+                self.plan_index * 0xC2B2AE3D
+                + self.sample_count * 0x27D4EB2F
+                + self.refill_event_index * 0x9E3779B1
+                + self.draw_index * 0x85EBCA77
+            ) & 0xFFFFFFFF
+            mixed ^= mixed >> 16
+            permutation = COLOR_PERMUTATIONS[
+                mixed % len(COLOR_PERMUTATIONS)
+            ]
+
             self.draw_index += 1
-            return colors[digit]
+            return colors[permutation[digit]]
 
         return self.fallback.choice(seq)
 
@@ -3472,8 +3546,8 @@ def _simulate_refill_chain_once(
     """
     对当前交换后的补球连锁执行一次随机样本模拟。
 
-    传入的棋盘已经完成第一次补球前的确定性合成；这里只统计第一次
-    随机补球之后产生的收益。
+    传入的棋盘已经完成第一次补球前的确定性合成；统计第一次补球价值
+    以及补球后产生的连锁收益。
     """
     if not isinstance(sample_plan, SamplingPlan):
         raise TypeError("sample_plan 必须是 SamplingPlan")
@@ -3481,13 +3555,17 @@ def _simulate_refill_chain_once(
     rng = _BalancedRefillRNG(
         sample_plan.seeds[sample_index],
         sample_index,
+        sample_plan.count,
+        sample_plan.pass_index,
     )
-    rng.sample_count = sample_plan.count
 
     state = copy_board(board_after_current_merge)
 
-    if empty_cells(state):
+    first_refill_gain = 0.0
+    empty_positions = empty_cells(state)
+    if empty_positions:
         state = refill_random(state, rng)
+        first_refill_gain = refill_energy_gain(empty_positions, state)
 
     state, _, chain_gain = resolve_with_refill(
         state,
@@ -3495,7 +3573,7 @@ def _simulate_refill_chain_once(
         max_rounds=20,
     )
 
-    return state, float(chain_gain)
+    return state, float(first_refill_gain + chain_gain)
 
 
 
@@ -3511,7 +3589,7 @@ def _simulate_next_swap_on_sample(
     对一个具体的下一步交换执行一次随机补球模拟。
 
     ``next_gain`` 是交换后、第一次补球前的确定性合成收益；
-    ``next_chain_gain`` 是第一次补球及其后续连锁产生的收益。
+    ``next_chain_gain`` 是第一次补球价值及其后续连锁产生的收益。
     评估只使用固定数量的样本，不展开指数级概率树。
     """
     if not isinstance(sample_plan, SamplingPlan):
@@ -3525,9 +3603,6 @@ def _simulate_next_swap_on_sample(
 
     swapped = swap_cells(board, p1, p2)
 
-    if not find_matches(swapped):
-        return None
-
     # 第一次补球前的确定性连锁计入 next_gain。
     next_state, merge_count, next_gain = resolve_merges(
         swapped,
@@ -3537,22 +3612,30 @@ def _simulate_next_swap_on_sample(
     if merge_count <= 0:
         return None
 
-    # 第一次补球是收益边界，之后的连锁计入 next_chain_gain。
-    if empty_cells(next_state):
+    # 第一次补球价值和之后的连锁统一计入 next_chain_gain。
+    first_refill_gain = 0.0
+    empty_positions = empty_cells(next_state)
+    if empty_positions:
         rng = _BalancedRefillRNG(
             sample_plan.seeds[sample_index],
             sample_index,
             sample_plan.count,
+            sample_plan.pass_index,
         )
         next_state = refill_random(
             next_state,
             rng,
         )
-        final_board, _, next_chain_gain = resolve_with_refill(
+        first_refill_gain = refill_energy_gain(
+            empty_positions,
+            next_state,
+        )
+        final_board, _, post_refill_chain_gain = resolve_with_refill(
             next_state,
             rng,
             max_rounds=20,
         )
+        next_chain_gain = first_refill_gain + post_refill_chain_gain
     else:
         final_board = next_state
         next_chain_gain = 0.0
@@ -3584,12 +3667,6 @@ def _evaluate_candidate_samples(
     """
     if not isinstance(sample_plan, SamplingPlan):
             raise TypeError("sample_plan 必须是 SamplingPlan")
-
-    # 验证每个补球位置的颜色分布保持均衡。
-    balance_report = _validate_sampling_plan_balance(
-        board_after_current_merge,
-        sample_plan,
-    )
 
     samples = []
     current_chain_values = []
@@ -3624,7 +3701,6 @@ def _evaluate_candidate_samples(
             "current_chain_samples": current_chain_values,
             "current_sample_count": sample_plan.count,
             "sample_plan": sample_plan,
-            "balance_report": balance_report,
             "next_gain": 0.0,
             "next_chain_gain": 0.0,
             "future_gain": 0.0,
@@ -3653,7 +3729,6 @@ def _evaluate_candidate_samples(
             "current_chain_samples": current_chain_values,
             "current_sample_count": sample_plan.count,
             "sample_plan": sample_plan,
-            "balance_report": balance_report,
             "next_gain": 0.0,
             "next_chain_gain": 0.0,
             "future_gain": 0.0,
@@ -3697,35 +3772,78 @@ def _evaluate_candidate_samples(
 
         per_swap[swap_key] = values
 
-    best = None
+    # 每个模拟棋盘都可以根据自己的实际补球结果重新选择下一步。
+    # 这里按“下一步完整收益”选择每个样本的最优交换：
+    # 直接合成收益 + 该次交换后的后续连锁收益。
+    # 然后对每个样本的最优结果求平均，而不是先固定同一个交换。
+    next_gain_samples = []
+    next_chain_samples = []
+    future_gain_samples = []
+    next_sample_swaps = []
+    potential_values = []
 
-    for swap_key, values in per_swap.items():
-        # 固定全部样本求平均，得到下一步交换收益期望。
-        next_gain_samples = [
-            float(v["next_gain"]) for v in values
-        ]
-        next_gain_expected = statistics.fmean(
-            next_gain_samples
+    for sample_index in range(len(samples)):
+        sample_best = None
+
+        # 排序保证收益相同时，选择结果仍然稳定。
+        for swap_key in sorted(all_swap_keys):
+            outcome = per_swap[swap_key][sample_index]
+
+            if not outcome.get("legal", False):
+                continue
+
+            next_gain = float(
+                outcome.get("next_gain", 0.0)
+            )
+            next_chain_gain = float(
+                outcome.get("next_chain_gain", 0.0)
+            )
+            future_gain = float(
+                outcome.get(
+                    "future_gain",
+                    next_gain + next_chain_gain,
+                )
+            )
+
+            if (
+                sample_best is None
+                or future_gain > sample_best["gain"]
+            ):
+                sample_best = {
+                    "swap_key": swap_key,
+                    "gain": future_gain,
+                    "next_gain": next_gain,
+                    "next_chain_gain": next_chain_gain,
+                    "potential": float(
+                        outcome.get("potential", 0.0)
+                    ),
+                }
+
+        if sample_best is None:
+            next_gain_samples.append(0.0)
+            next_chain_samples.append(0.0)
+            future_gain_samples.append(0.0)
+            next_sample_swaps.append(None)
+            continue
+
+        next_gain_samples.append(sample_best["next_gain"])
+        next_chain_samples.append(
+            sample_best["next_chain_gain"]
         )
+        future_gain_samples.append(sample_best["gain"])
+        next_sample_swaps.append(sample_best["swap_key"])
+        potential_values.append(sample_best["potential"])
 
-        legal_count = sum(
-            1 for v in values if v.get("legal", False)
-        )
+    next_gain_expected = statistics.fmean(
+        next_gain_samples
+    )
+    next_chain_gain_expected = statistics.fmean(
+        next_chain_samples
+    )
+    future_gain_expected = statistics.fmean(
+        future_gain_samples
+    )
 
-        if best is None or next_gain_expected > best["next_gain"]:
-            best = {
-                "swap_key": swap_key,
-                "next_gain": float(next_gain_expected),
-                "values": values,
-                "next_gain_samples": next_gain_samples,
-                "legal_count": legal_count,
-            }
-
-    potential_values = [
-        float(v.get("potential", 0.0))
-        for v in best["values"]
-        if v.get("legal", False)
-    ]
     potential = (
         statistics.fmean(potential_values)
         if potential_values else 0.0
@@ -3736,21 +3854,24 @@ def _evaluate_candidate_samples(
         "current_chain_samples": current_chain_values,
         "current_sample_count": sample_plan.count,
         "sample_plan": sample_plan,
-        "balance_report": balance_report,
+        # 下一步完整收益由每个样本自己的最优下一步决定。
+        "next_gain": float(next_gain_expected),
 
-        # 最终评分只使用“下一步直接交换收益期望”。
-        "next_gain": float(best["next_gain"]),
-
-        # 该字段保留在统一结果结构中，但不参与评分。
-        "next_chain_gain": 0.0,
-        "future_gain": float(best["next_gain"]),
+        "next_chain_gain": float(next_chain_gain_expected),
+        "future_gain": float(future_gain_expected),
 
         "potential": float(potential),
-        "next_p1": best["swap_key"][0],
-        "next_p2": best["swap_key"][1],
-        "next_gain_samples": list(best["next_gain_samples"]),
-        "next_chain_samples": [],
-        "next_legal_count": int(best["legal_count"]),
+        # 不再提供一个统一的下一步坐标，因为每个样本可能选择不同交换。
+        "next_p1": None,
+        "next_p2": None,
+        "next_sample_swaps": next_sample_swaps,
+        "next_gain_samples": list(next_gain_samples),
+        "next_chain_samples": list(next_chain_samples),
+        "next_legal_count": sum(
+            1 for swap_key in next_sample_swaps
+            if swap_key is not None
+        ),
+        "adaptive_lookahead": True,
         "lookahead_enabled": True,
     }
 
@@ -3768,11 +3889,14 @@ def analyze_all_swaps(board, *args, **kwargs):
       每个随机样本的真实连锁收益平均值
 
     下一步：
-      对每个具体交换跨全部随机样本求期望，
-      然后选择期望最高的交换。
+      每个随机样本分别选择自己的最优下一步交换，
+      然后对这些最优收益求平均。
+
+    最终真实收益：
+      当前收益 + 下一步收益期望
 
     最终评分：
-      当前收益 + 下一步收益期望
+      最终真实收益 / 2
 
     局面潜力只显示，不进入评分。
     """
@@ -3907,6 +4031,12 @@ def analyze_all_swaps(board, *args, **kwargs):
 
                 r["next_p1"] = future["next_p1"]
                 r["next_p2"] = future["next_p2"]
+                r["next_sample_swaps"] = list(
+                    future.get("next_sample_swaps", [])
+                )
+                r["adaptive_lookahead"] = bool(
+                    future.get("adaptive_lookahead", False)
+                )
                 r["lookahead_enabled"] = bool(
                     future.get("lookahead_enabled", True)
                 )
@@ -3917,11 +4047,10 @@ def analyze_all_swaps(board, *args, **kwargs):
                 r["chain_value"] = r["current_chain_gain"]
                 r["future_potential"] = r["potential"]
 
-                # 最终评分 = 当前交换收益 + 当前交换后连锁期望
-                #           + 下一步交换收益期望。
-                # 下一步交换后的连锁收益不参与评分。
+                # 最终真实收益 = 当前交换完整收益
+                #               + 下一步交换完整收益期望。
                 lookahead_gain = (
-                    r["next_gain"]
+                    r["future_gain"]
                     if r.get("lookahead_enabled", True)
                     else 0.0
                 )
@@ -3932,7 +4061,8 @@ def analyze_all_swaps(board, *args, **kwargs):
 
                 # 局面潜力不换算成能量。
                 r["potential_bonus"] = 0.0
-                r["final_score"] = r["real_score"]
+                # 最终评分按当前真实收益的一半计入排序。
+                r["final_score"] = r["real_score"] / 2.0
                 r["future_score"] = r["final_score"]
                 r["score"] = r["final_score"]
 
@@ -3958,7 +4088,7 @@ def analyze_all_swaps(board, *args, **kwargs):
 
         return results
 
-    # 快速筛选全部 351 种交换，保留前 12 名。
+    # 快速筛选全部 351 种交换，保留前12名。
     quick_start = time.perf_counter()
     quick = []
 
@@ -4007,14 +4137,20 @@ def analyze_all_swaps(board, *args, **kwargs):
     )
 
     quick = _unique_swap_candidates(quick)
+
     quick = quick[:FAST_FILTER_LIMIT]
     quick_elapsed = time.perf_counter() - quick_start
 
     # 对全部快速筛选候选统一使用 9 个均衡样本评估。
     final_start = time.perf_counter()
+    sample_plan = make_evaluation_plan(current_step)
+    _validate_sampling_plan_balance(
+        [[None for _ in range(COLS)] for _ in range(ROWS)],
+        sample_plan,
+    )
     final = evaluate_candidates(
         quick,
-        make_evaluation_plan(),
+        sample_plan,
     )
     final_elapsed = time.perf_counter() - final_start
 
@@ -4091,11 +4227,8 @@ def print_swap_results(results):
         print("当前没有找到有效交换。")
         return
 
-    # 输出全部快速筛选后进入最终评估的候选。
-    for i, result in enumerate(
-        results[:FAST_FILTER_LIMIT],
-        1,
-    ):
+    # 输出全部进入最终评估的候选。
+    for i, result in enumerate(results, 1):
         print(
             f"{i}. {position_name(result['p1'])} <-> "
             f"{position_name(result['p2'])}"
@@ -4126,24 +4259,47 @@ def print_swap_results(results):
         )
 
         if result.get("lookahead_enabled", True):
-            next_p1 = result.get("next_p1")
-            next_p2 = result.get("next_p2")
-
-            if next_p1 is not None and next_p2 is not None:
-                next_swap_text = (
-                    f"{position_name(next_p1)} <-> "
-                    f"{position_name(next_p2)}"
-                )
+            if result.get("adaptive_lookahead", False):
+                next_swap_text = "根据实际补球结果重新选择"
             else:
-                next_swap_text = "无"
+                next_p1 = result.get("next_p1")
+                next_p2 = result.get("next_p2")
+
+                if next_p1 is not None and next_p2 is not None:
+                    next_swap_text = (
+                        f"{position_name(next_p1)} <-> "
+                        f"{position_name(next_p2)}"
+                    )
+                else:
+                    next_swap_text = "无"
 
             print(
                 f"   下一步期望最优交换 = {next_swap_text}"
             )
 
             print(
-                f"   下一步交换收益期望 = "
+                f"   下一步直接收益期望 = "
                 f"{result.get('next_gain', 0.0):.2f}"
+            )
+
+            next_chain_samples = result.get(
+                "next_chain_samples",
+                [],
+            )
+            if next_chain_samples:
+                print(
+                    "   下一步连锁样本（"
+                    f"{len(next_chain_samples)}个）："
+                    + ", ".join(
+                        f"{x:.2f}" for x in next_chain_samples
+                    )
+                    + " | 平均="
+                    + f"{statistics.fmean(next_chain_samples):.2f}"
+                )
+
+            print(
+                f"   下一步完整收益期望 = "
+                f"{result.get('future_gain', 0.0):.2f}"
             )
 
             legal_counts = result.get("next_legal_counts", {})
@@ -4212,18 +4368,40 @@ def print_best_swap(results):
     )
 
     if best.get("lookahead_enabled", True):
-        next_p1 = best.get("next_p1")
-        next_p2 = best.get("next_p2")
+        if not best.get("adaptive_lookahead", False):
+            next_p1 = best.get("next_p1")
+            next_p2 = best.get("next_p2")
 
-        if next_p1 is not None and next_p2 is not None:
+            if next_p1 is not None and next_p2 is not None:
+                print(
+                    "下一步期望最优交换："
+                    f"{position_name(next_p1)} <-> "
+                    f"{position_name(next_p2)}"
+                )
+
+        print(
+            f"下一步直接收益期望："
+            f"{best.get('next_gain', 0.0):.2f}"
+        )
+
+        next_chain_samples = best.get(
+            "next_chain_samples",
+            [],
+        )
+        if next_chain_samples:
             print(
-                "下一步期望最优交换："
-                f"{position_name(next_p1)} <-> {position_name(next_p2)}"
+                "下一步连锁样本（"
+                f"{len(next_chain_samples)}个）："
+                + ", ".join(
+                    f"{x:.2f}" for x in next_chain_samples
+                )
+                + " | 平均="
+                + f"{statistics.fmean(next_chain_samples):.2f}"
             )
 
         print(
-            f"下一步交换收益期望："
-            f"{best.get('next_gain', 0.0):.2f}"
+            f"下一步完整收益期望："
+            f"{best.get('future_gain', 0.0):.2f}"
         )
     else:
         print("已到最后一步，最终评分不计入下一步交换收益期望")
