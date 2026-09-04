@@ -23,10 +23,18 @@ import statistics
 import queue
 import contextlib
 import io
+import ctypes
 
-# 自动运行/搜索停止标志
-STOP_EVENT = threading.Event()
+# 自动运行状态
+AUTO_PAUSED = False
 AUTO_STOP_REQUESTED = False
+HOTKEYS_REGISTERED = False
+RESELECT_REQUESTED = threading.Event()
+RESELECT_RESULT = object()
+
+# 当前校准方框。程序运行期间保留显示，退出时统一关闭。
+SELECTION_OVERLAY = None
+
 # 交换评估缓存
 SWAP_EVAL_CACHE = {}
 
@@ -38,6 +46,12 @@ SWAP_EVAL_CACHE = {}
 
 ROWS = 3
 COLS = 9
+
+# 按当前棋盘截图 862×288 作为正常尺寸，防止误框选过小区域。
+REFERENCE_BOARD_WIDTH = 862
+REFERENCE_BOARD_HEIGHT = 288
+MIN_BOARD_WIDTH = REFERENCE_BOARD_WIDTH / 2
+MIN_BOARD_HEIGHT = REFERENCE_BOARD_HEIGHT / 2
 
 DEBUG_DIR = "debug"
 BOARD_DEBUG_DIR = os.path.join(DEBUG_DIR, "board")
@@ -286,7 +300,6 @@ def get_debug_step_dir(step):
 
 
 # 每个方格只取中央区域，尽量排除方框、边框和外部背景。
-
 CENTER_RATIO = 0.82
 
 
@@ -353,111 +366,234 @@ FINAL_SAMPLE_COUNT = 9
 
 # 搜索运行统计，只用于观察计算量，不参与评分。
 SEARCH_STATS = {
-    "quick_candidates": 0,
-    "future_simulations": 0,
     "cache_hits": 0,
-    "cache_misses": 0,
 }
 
-def wait_mouse(message):
-    """等待用户确认鼠标位置，并返回当前屏幕坐标。"""
+
+def is_left_mouse_button_down():
+    """读取 Windows 当前左键状态。"""
+    return bool(
+        ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000
+    )
+
+
+def set_overlay_click_through(overlay):
+    """让已完成的校准方框不拦截游戏鼠标点击。"""
+    hwnd = overlay.winfo_id()
+    user32 = ctypes.windll.user32
+    get_window_long = getattr(
+        user32,
+        "GetWindowLongPtrW",
+        user32.GetWindowLongW,
+    )
+    set_window_long = getattr(
+        user32,
+        "SetWindowLongPtrW",
+        user32.SetWindowLongW,
+    )
+
+    style = get_window_long(hwnd, -20)
+    style |= 0x00000020  # WS_EX_TRANSPARENT
+    style |= 0x08000000  # WS_EX_NOACTIVATE
+    set_window_long(hwnd, -20, style)
+
+
+def close_selection_overlay():
+    """关闭当前校准方框并释放窗口资源。"""
+    global SELECTION_OVERLAY
+
+    if SELECTION_OVERLAY is not None:
+        try:
+            for border in SELECTION_OVERLAY["borders"]:
+                border.destroy()
+            SELECTION_OVERLAY["root"].destroy()
+        except Exception:
+            pass
+
+    SELECTION_OVERLAY = None
+
+
+def update_selection_overlay(overlay, left, top, right, bottom):
+    """更新选区四条边框的位置，不覆盖中间的游戏画面。"""
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    thickness = 3
+
+    def geometry_offset(value):
+        return f"+{value}" if value >= 0 else str(value)
+
+    geometries = (
+        (left, top, width, thickness),
+        (left, bottom - thickness, width, thickness),
+        (left, top, thickness, height),
+        (right - thickness, top, thickness, height),
+    )
+
+    for border, (x, y, border_width, border_height) in zip(
+        overlay["borders"],
+        geometries,
+    ):
+        border.geometry(
+            f"{border_width}x{border_height}"
+            f"{geometry_offset(x)}{geometry_offset(y)}"
+        )
+
+    overlay["root"].update_idletasks()
+    overlay["root"].update()
+
+
+def select_board_region():
+    """等待用户拖动鼠标框选棋盘，并返回四个边界坐标。"""
+    global SELECTION_OVERLAY
+
+    import tkinter as tk
+
+    close_selection_overlay()
 
     print()
-    print(message)
-
     print(
-        "请把鼠标移动到目标位置，"
-        "然后按 Enter。"
+        "按住鼠标左键，拖动鼠标, "
+        "确保所有格子都包括在内后，松开鼠标完成框选。"
     )
 
-    input()
+    overlay = None
 
-    wait_while_paused()
+    try:
+        root = tk.Tk()
+        root.withdraw()
 
-    if AUTO_STOP_REQUESTED:
-        return None
+        borders = []
+        for _ in range(4):
+            border = tk.Toplevel(root)
+            border.overrideredirect(True)
+            border.attributes("-topmost", True)
+            border.configure(bg="#00ff00")
+            border.geometry("1x1+0+0")
+            border.withdraw()
+            borders.append(border)
 
-    pos = pyautogui.position()
+        overlay = {
+            "root": root,
+            "borders": borders,
+        }
+        SELECTION_OVERLAY = overlay
+        root.update_idletasks()
+        root.update()
 
-    x = int(pos.x)
-    y = int(pos.y)
+        for border in borders:
+            set_overlay_click_through(border)
 
-    print(
-        f"记录坐标：({x}, {y})"
-    )
+    except Exception as exc:
+        if overlay is not None:
+            close_selection_overlay()
+        overlay = None
+        print(f"提示：无法显示框选方框，将继续记录鼠标区域（{exc}）。")
 
-    return x, y
+    selection_completed = False
+
+    try:
+        while not is_left_mouse_button_down():
+            if AUTO_STOP_REQUESTED:
+                return None
+            wait_while_paused()
+            if overlay is not None:
+                overlay["root"].update_idletasks()
+                overlay["root"].update()
+            time.sleep(0.01)
+
+        start = pyautogui.position()
+        start_x = int(start.x)
+        start_y = int(start.y)
+
+        rectangle_visible = False
+        if overlay is not None:
+            for border in overlay["borders"]:
+                border.deiconify()
+                border.lift()
+            rectangle_visible = True
+
+        while is_left_mouse_button_down():
+            if AUTO_STOP_REQUESTED:
+                return None
+
+            current = pyautogui.position()
+            current_x = int(current.x)
+            current_y = int(current.y)
+
+            if rectangle_visible:
+                update_selection_overlay(
+                    overlay,
+                    min(start_x, current_x),
+                    min(start_y, current_y),
+                    max(start_x, current_x),
+                    max(start_y, current_y),
+                )
+
+            time.sleep(0.01)
+
+        end = pyautogui.position()
+        selection_completed = True
+
+    finally:
+        if not selection_completed and overlay is not None:
+            close_selection_overlay()
+
+    left = min(int(start.x), int(end.x))
+    top = min(int(start.y), int(end.y))
+    right = max(int(start.x), int(end.x))
+    bottom = max(int(start.y), int(end.y))
+
+    return left, top, right, bottom
 
 
-def calibrate():
-    """通过棋盘整体左上角和右下角计算截图区域与网格间距。"""
+def calibrate(wait_for_enter=True):
+    """通过鼠标拖动框选棋盘，计算截图区域与网格间距。"""
 
     print()
     print("=" * 80)
     print("框选区域")
     print("=" * 80)
 
-    first_point = wait_mouse(
-        "① 请移动到第1行第1列格子方框的左上内角，然后按 Enter"
-    )
+    if wait_for_enter:
+        print(
+            "确保程序切到前台，且所有格子完整显示后，"
+            "按 Enter 开始框选。"
+        )
+        input()
 
-    if first_point is None:
+    wait_while_paused()
+
+    if AUTO_STOP_REQUESTED:
         return None
 
-    grid_left, grid_top = first_point
+    while True:
+        selected_region = select_board_region()
 
-    second_point = wait_mouse(
-        "② 请移动到第3行第9列格子方框的右下内角，然后按 Enter"
-    )
+        if selected_region is None:
+            return None
 
-    if second_point is None:
-        return None
+        grid_left, grid_top, grid_right, grid_bottom = selected_region
+        grid_width = grid_right - grid_left
+        grid_height = grid_bottom - grid_top
 
-    grid_right, grid_bottom = second_point
+        if (
+            grid_width >= MIN_BOARD_WIDTH
+            and grid_height >= MIN_BOARD_HEIGHT
+        ):
+            break
 
-    grid_width = grid_right - grid_left
-    grid_height = grid_bottom - grid_top
-
-    if grid_width <= 0 or grid_height <= 0:
-        print("校准失败：右下角必须位于左上角的右下方。")
-        return None
+        print(
+            "框选区域过小，请重新框选。(按F9可退出程序)"
+        )
 
     dx = grid_width / COLS
     dy = grid_height / ROWS
 
-    # x1、y1 始终表示第 1 行第 1 列球的中心，点击坐标仍然准确。
+    # x1、y1 表示第 1 行第 1 列球的中心，点击坐标仍然准确。
     x1 = grid_left + dx / 2
     y1 = grid_top + dy / 2
 
-
-    print()
-    print("=" * 80)
-    print("校准结果")
-    print("=" * 80)
-
-    print(
-        f"截图左上角：({grid_left}, {grid_top})"
-    )
-
-    print(
-        f"截图右下角：({grid_right}, {grid_bottom})"
-    )
-
-    print(
-        f"单格宽度：{dx:.3f}"
-    )
-
-    print(
-        f"单格高度：{dy:.3f}"
-    )
-
-
-    return (
-        x1,
-        y1,
-        dx,
-        dy
-    )
+    return x1, y1, dx, dy
 
 
 def crop_cell(
@@ -1067,10 +1203,23 @@ def recognize_cell(
 ):
     """识别单个格子的颜色、等级和置信度。"""
 
+    unknown_result = {
+        "type": "?",
+        "level": 0,
+        "area_ratio": 0,
+        "confidence": 0,
+    }
+
+    if cell is None or cell.size == 0:
+        return unknown_result, {}
+
     center = \
         get_center_region(
             cell
         )
+
+    if center.size == 0:
+        return unknown_result, {}
 
 
     h, w = center.shape[:2]
@@ -1380,12 +1529,6 @@ def recognize_cell(
     )
 
 
-# F8 暂停/继续，F9 退出。
-AUTO_PAUSED = False
-AUTO_STOP_REQUESTED = False
-HOTKEYS_REGISTERED = False
-
-
 def request_auto_stop(message="收到停止指令"):
     """执行统一的停止流程，供 F9 和自动结束条件共同调用。"""
     global AUTO_STOP_REQUESTED
@@ -1400,10 +1543,21 @@ def request_auto_stop(message="收到停止指令"):
     print("=" * 90)
 
 
+def request_reselect():
+    """记录 F7 重新框选请求，等待当前操作安全结束后执行。"""
+    global AUTO_PAUSED
+
+    if AUTO_STOP_REQUESTED:
+        return
+
+    AUTO_PAUSED = False
+    RESELECT_REQUESTED.set()
+    print()
+    print("已收到 F7，当前操作完成后重新框选。")
+
+
 def setup_hotkeys():
     """注册全局热键；重复调用时不重复注册。"""
-    global AUTO_PAUSED
-    global AUTO_STOP_REQUESTED
     global HOTKEYS_REGISTERED
 
     if HOTKEYS_REGISTERED:
@@ -1430,6 +1584,7 @@ def setup_hotkeys():
 
     keyboard.add_hotkey("f8", toggle_pause)
     keyboard.add_hotkey("f9", stop_program)
+    keyboard.add_hotkey("f7", request_reselect)
     HOTKEYS_REGISTERED = True
 
 
@@ -1459,6 +1614,7 @@ def pause_for_no_move():
     print()
     print("自动操作已暂停。")
     print("你可以手动完成一次交换，然后按 F8。")
+    print("F7 = 重新框选")
     print("F8 = 继续")
     print("F9 = 退出")
     print("=" * 90)
@@ -1494,7 +1650,7 @@ BOARD_STABLE_TIME = 0.25
 MAX_WAIT_AFTER_SWAP = 3.00
 
 # 自动运行最长时间（秒）
-GAME_MAX_SECONDS = 3600.0
+GAME_MAX_SECONDS = 1200.0
 
 
 def get_cell_center_from_board(r, c, x1, y1, dx, dy):
@@ -1636,6 +1792,9 @@ def wait_for_initial_board_ready(sct, monitor, x1, y1, dx, dy):
         if AUTO_STOP_REQUESTED:
             return None
 
+        if RESELECT_REQUESTED.is_set():
+            return RESELECT_RESULT
+
         wait_while_paused()
 
         if AUTO_STOP_REQUESTED:
@@ -1746,9 +1905,12 @@ def wait_for_board_stable(
 
     while True:
 
-        if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
+        if AUTO_STOP_REQUESTED:
             print("\r收到停止指令，停止等待棋盘稳定。")
             return time.monotonic() - start_time
+
+        if RESELECT_REQUESTED.is_set():
+            return RESELECT_RESULT
 
         elapsed = (
             time.monotonic()
@@ -1844,7 +2006,7 @@ def click_best_swap(
         False = 没有可执行交换
     """
 
-    if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
+    if AUTO_STOP_REQUESTED:
         return False
 
     if not results:
@@ -1906,27 +2068,36 @@ def click_best_swap(
         )
 
 
-    # 执行交换。
+    # 执行交换。鼠标移到屏幕角落时保留 PyAutoGUI 的紧急停止保护。
+    try:
+        pyautogui.click(
+            x1_click,
+            y1_click
+        )
 
-    pyautogui.click(
-        x1_click,
-        y1_click
-    )
+        time.sleep(
+            AUTO_CLICK_DELAY
+        )
 
-    time.sleep(
-        AUTO_CLICK_DELAY
-    )
+        if AUTO_STOP_REQUESTED:
+            return False
 
-    if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
+        pyautogui.click(
+            x2_click,
+            y2_click
+        )
+
+        # 点击完成后立即移出棋盘，避免鼠标指针遮挡小球
+        pyautogui.moveTo(
+            MOUSE_MOVE_OUT_X,
+            MOUSE_MOVE_OUT_Y,
+            duration=0.05
+        )
+    except pyautogui.FailSafeException:
+        request_auto_stop(
+            "检测到鼠标位于屏幕角落，已安全停止自动点击"
+        )
         return False
-
-    pyautogui.click(
-        x2_click,
-        y2_click
-    )
-
-    # 点击完成后立即移出棋盘，避免鼠标指针遮挡小球
-    pyautogui.moveTo(MOUSE_MOVE_OUT_X, MOUSE_MOVE_OUT_Y, duration=0.05)
 
 
     print()
@@ -1935,7 +2106,7 @@ def click_best_swap(
     )
 
 
-    wait_for_board_stable(
+    stable_result = wait_for_board_stable(
         sct,
         monitor,
         x1,
@@ -1949,6 +2120,8 @@ def click_best_swap(
         ),
     )
 
+    if stable_result is RESELECT_RESULT:
+        return RESELECT_RESULT
 
     return True
 
@@ -1959,7 +2132,6 @@ def run_auto_loop(
     dx,
     dy
 ):
-    global AUTO_STOP_REQUESTED
     """
     自动运行主循环：
 
@@ -2008,6 +2180,33 @@ def run_auto_loop(
 
             if AUTO_STOP_REQUESTED:
                 break
+
+            if RESELECT_REQUESTED.is_set():
+                RESELECT_REQUESTED.clear()
+                calibration = calibrate(
+                    wait_for_enter=False
+                )
+
+                if calibration is None:
+                    break
+
+                x1, y1, dx, dy = calibration
+                monitor = get_board_capture_monitor(
+                    x1,
+                    y1,
+                    dx,
+                    dy,
+                    full_monitor,
+                )
+                capture_x1, capture_y1 = get_capture_board_origin(
+                    x1,
+                    y1,
+                    monitor,
+                )
+                last_unknown_count = None
+                waiting_for_board = False
+                print("已更新棋盘框选区域，继续自动运行。")
+                continue
 
             wait_while_paused()
 
@@ -2146,15 +2345,12 @@ def run_auto_loop(
 
             if unknown_count > 0:
 
-                # 20 步完成后如果下一轮整盘都无法识别，通常表示游戏已结束。
-                # 使用与 F9 相同的停止流程，不再继续等待或误执行第 21 步。
-                if (
-                    debug_step_count >= TOTAL_GAME_MOVES
-                    and unknown_count == ROWS * COLS
-                ):
+                # 20 步完成后只要仍有未识别格，通常表示游戏已结束。
+                # 使用与 F9 相同的停止流程，不再继续等待或误执行下一步。
+                if debug_step_count >= TOTAL_GAME_MOVES:
                     move_count -= 1
                     request_auto_stop(
-                        "已完成 20 步，棋盘未识别到能量球，自动执行 F9"
+                        "已完成 20 步，棋盘仍有未识别能量球，自动执行 F9"
                     )
                     break
 
@@ -2216,7 +2412,7 @@ def run_auto_loop(
                 break
 
             # 搜索完成后再次检查停止状态，避免误执行点击。
-            if AUTO_STOP_REQUESTED or STOP_EVENT.is_set():
+            if AUTO_STOP_REQUESTED:
                 print()
                 print("收到停止指令，不执行本轮交换。")
                 break
@@ -2260,6 +2456,9 @@ def run_auto_loop(
                 monitor,
                 step=move_count,
             )
+
+            if swap_completed is RESELECT_RESULT:
+                continue
 
             if swap_completed:
                 debug_step_count += 1
@@ -2306,26 +2505,6 @@ def make_board_state(board):
                 state_row.append(None)
         state.append(state_row)
     return state
-
-
-def cell_to_text(cell):
-    return "?" if cell is None else f"{cell[1]}{cell[0]}"
-
-
-def position_name(pos):
-    return f"r{pos[0] + 1}c{pos[1] + 1}"
-
-
-def print_board_state(board):
-    print()
-    print("=" * 90)
-    print("识别结果")
-    print("=" * 90)
-    for r in range(ROWS):
-        print(
-            f"第{r + 1}行： "
-            + "   ".join(cell_to_text(board[r][c]) for c in range(COLS))
-        )
 
 
 def same_ball(a, b):
@@ -2416,15 +2595,6 @@ def find_matches(board):
     )
 
 
-def print_match_group(group, board):
-    ball = board[group[0][0]][group[0][1]]
-    positions = " ".join(position_name(p) for p in group)
-
-    print(
-        f"      {cell_to_text(ball)}: {positions}"
-    )
-
-
 # 搜索、评分与合成模拟
 # 重要：
 #   下面的规则以已确认的真实游戏行为为准。
@@ -2456,15 +2626,6 @@ TYPE_ORDER = ("f", "r", "w")
 
 # 评分参数集中在此，便于统一调整。
 SCORE_WEIGHTS = {
-    # 当前交换/当前完整连锁的真实能量
-    "immediate": 1.00,
-
-    # 保留该权重字段；最终评分不对后续收益做额外折扣。
-    "future": 1.00,
-
-    # 当前一步中额外发生的连锁收益
-    "chain": 1.00,
-
     # 高等级球保留价值
     "inventory": 0.08,
 
@@ -2811,10 +2972,8 @@ def evaluate_swap(board, p1, p2):
             p1=p1,
             p2=p2,
             board=simulated,
-            matches=[],
             merge_gain=0.0,
             merge_count=0,
-            score=0.0,
         )
 
     # 交换后先把第一次补球之前的确定性连续合成全部处理完。
@@ -2827,10 +2986,8 @@ def evaluate_swap(board, p1, p2):
         p1=p1,
         p2=p2,
         board=resolved,
-        matches=matches,
         merge_gain=merge_gain,
         merge_count=merge_count,
-        score=merge_gain,
     )
 
 
@@ -2852,7 +3009,7 @@ def generate_all_swaps():
 
 
 CANDIDATE_FIELDS = (
-    "p1", "p2", "board", "matches",
+    "p1", "p2", "board",
     "immediate_gain",
     "future_gain",
     "chain_gain",
@@ -2913,12 +3070,9 @@ def _unique_swap_candidates(candidates):
 
 def make_candidate(
     *,
-    p1, p2, board, matches=None,
+    p1, p2, board,
     merge_gain=0.0, merge_count=0,
-    score=None, first_score=None,
-    second_expected=0.0, chain_value=0.0,
-    future_potential=0.0,
-    quick_score=None, future_score=0.0,
+    quick_score=None,
     immediate_gain=None, future_gain=0.0, chain_gain=0.0,
     potential=0.0, potential_bonus=0.0,
     real_score=None, final_score=None,
@@ -2934,16 +3088,8 @@ def make_candidate(
     )
     potential = float(potential or 0.0)
     potential_bonus = float(potential_bonus or 0.0)
-    future = float(
-        future_gain
-        if future_gain is not None
-        else second_expected
-    )
-    chain = float(
-        chain_gain
-        if chain_gain is not None
-        else chain_value
-    )
+    future = float(future_gain)
+    chain = float(chain_gain)
 
     if real_score is None:
         real_score = immediate + future
@@ -2955,7 +3101,6 @@ def make_candidate(
         "p1": p1,
         "p2": p2,
         "board": board,
-        "matches": list(matches or []),
         "immediate_gain": immediate,
         "future_gain": future,
         "chain_gain": chain,
@@ -2982,7 +3127,6 @@ def candidate_from_result(result):
         p1=result.get("p1"),
         p2=result.get("p2"),
         board=result.get("board"),
-        matches=result.get("matches"),
         merge_gain=result.get(
             "merge_gain",
             result.get("immediate_gain", 0.0),
@@ -3036,7 +3180,7 @@ def assert_candidate(candidate):
 # 减少后续随机模拟数量，在速度和搜索范围之间取平衡。
 FAST_FILTER_LIMIT = 12
 # 只并行随机评估；截图、识别和点击始终由主线程执行。
-EVALUATION_WORKERS = 6
+EVALUATION_WORKERS = 8
 EVALUATION_CACHE_LIMIT = 30000
 
 # 游戏通常进行 20 步。这里只控制评分是否继续看下一步，
@@ -3109,15 +3253,9 @@ def make_sampling_plan(pass_index, count):
 
 
 
-def make_evaluation_plan(pass_index):
-    """根据评估轮次创建对应的采样计划。"""
-    pass_index = int(pass_index)
-    if pass_index != 2:
-        raise ValueError(f"不支持的评估轮次：{pass_index}")
-
-    count = FINAL_SAMPLE_COUNT
-
-    return make_sampling_plan(pass_index, count)
+def make_evaluation_plan():
+    """创建当前搜索使用的统一采样计划。"""
+    return make_sampling_plan(2, FINAL_SAMPLE_COUNT)
 
 
 
@@ -3145,11 +3283,6 @@ def _balanced_type_for_sample(
         第 0 个空位：每种颜色 3 次
         第 1 个空位：每种颜色 3 次
         并且两个变量的 3×3 组合各出现一次。
-
-    对 6 个样本：
-        每个空位仍严格 f/r/w 各 2 次；
-        由于 6 不是 3²，不能覆盖全部 9 个组合，但不再人为绑定
-        两个变量。
 
     对超过 2 个变量的情况，使用有限样本下的循环平衡设计。
     """
@@ -3665,7 +3798,7 @@ def analyze_all_swaps(board, *args, **kwargs):
         executor = None
         try:
             for index, result in enumerate(candidates, 1):
-                if STOP_EVENT.is_set() or AUTO_STOP_REQUESTED:
+                if AUTO_STOP_REQUESTED:
                     break
 
                 b2 = result.get("board")
@@ -3688,7 +3821,6 @@ def analyze_all_swaps(board, *args, **kwargs):
                         SWAP_EVAL_CACHE[cache_key],
                     )
                 else:
-                    SEARCH_STATS["cache_misses"] += 1
                     pending.append((index, result, cache_key))
 
             if pending:
@@ -3725,9 +3857,6 @@ def analyze_all_swaps(board, *args, **kwargs):
                 if hasattr(future, "result"):
                     future = future.result()
                     SWAP_EVAL_CACHE[item[2]] = future
-                    SEARCH_STATS["future_simulations"] += (
-                        sample_plan.count
-                    )
 
                 r = dict(result)
 
@@ -3858,8 +3987,6 @@ def analyze_all_swaps(board, *args, **kwargs):
         assert_candidate(result)
         quick.append(result)
 
-    SEARCH_STATS["quick_candidates"] += len(quick)
-
     if not quick:
         if PRINT_SEARCH_BENCHMARK:
             print(
@@ -3887,7 +4014,7 @@ def analyze_all_swaps(board, *args, **kwargs):
     final_start = time.perf_counter()
     final = evaluate_candidates(
         quick,
-        make_evaluation_plan(2),
+        make_evaluation_plan(),
     )
     final_elapsed = time.perf_counter() - final_start
 
@@ -3910,6 +4037,29 @@ def analyze_all_swaps(board, *args, **kwargs):
         )
     return final
 
+
+
+# 输出与调试信息
+
+
+def cell_to_text(cell):
+    return "?" if cell is None else f"{cell[1]}{cell[0]}"
+
+
+def position_name(pos):
+    return f"r{pos[0] + 1}c{pos[1] + 1}"
+
+
+def print_board_state(board):
+    print()
+    print("=" * 90)
+    print("识别结果")
+    print("=" * 90)
+    for r in range(ROWS):
+        print(
+            f"第{r + 1}行： "
+            + "   ".join(cell_to_text(board[r][c]) for c in range(COLS))
+        )
 
 
 def save_swap_results(results, step):
@@ -4086,16 +4236,6 @@ def print_best_swap(results):
         f"{best.get('final_score', best.get('score', 0.0)):.2f}"
     )
 
-    print()
-    print("当前交换后产生：")
-
-    for group in best["matches"]:
-        print_match_group(
-            group,
-            best["board"]
-        )
-
-
 
 def main():
     """完成热键注册、棋盘校准、初始识别和自动交换。"""
@@ -4105,7 +4245,7 @@ def main():
 
     AUTO_PAUSED = False
     AUTO_STOP_REQUESTED = False
-    STOP_EVENT.clear()
+    RESELECT_REQUESTED.clear()
     setup_hotkeys()
 
     print()
@@ -4114,6 +4254,7 @@ def main():
     print("=" * 90)
 
     print()
+    print("F7：重新框选")
     print("F8：暂停 / 继续")
     print("F9：退出")
 
@@ -4133,35 +4274,7 @@ def main():
     x1, y1, dx, dy = calibration
 
 
-    cell_w = abs(dx) * 0.90
-
-    cell_h = abs(dy) * 0.90
-
-
-    print()
-
-    print(
-        f"识别格子尺寸："
-        f"{cell_w:.2f} × "
-        f"{cell_h:.2f}"
-    )
-
-
-    # 等待用户确认游戏画面已经准备好。
-    print()
-    print(
-        "准备好后按 Enter 开始..."
-    )
-
-    input()
-
-    wait_while_paused()
-
-    if AUTO_STOP_REQUESTED:
-        print("收到停止指令，程序结束。")
-        return
-
-    # 用 MSS 连续截取屏幕，等待完整棋盘稳定出现。
+    # 框选完成后直接等待完整棋盘稳定出现。
     with mss.MSS() as sct:
 
         full_monitor = sct.monitors[0]
@@ -4173,25 +4286,47 @@ def main():
             full_monitor,
         )
 
-        print()
-        initial_result = wait_for_initial_board_ready(
-            sct,
-            monitor,
-            x1,
-            y1,
-            dx,
-            dy
-        )
+        while True:
+            print()
+            initial_result = wait_for_initial_board_ready(
+                sct,
+                monitor,
+                x1,
+                y1,
+                dx,
+                dy
+            )
 
-        if initial_result is None:
-            print("收到停止指令，程序结束。")
-            return
+            if initial_result is RESELECT_RESULT:
+                RESELECT_REQUESTED.clear()
+                calibration = calibrate(
+                    wait_for_enter=False
+                )
 
-        _, capture_x1, capture_y1, dx, dy = initial_result
-        x1 = capture_x1 + monitor["left"]
-        y1 = capture_y1 + monitor["top"]
+                if calibration is None:
+                    print("收到停止指令，程序结束。")
+                    return
 
-        print("初始棋盘已稳定，开始截图...")
+                x1, y1, dx, dy = calibration
+                monitor = get_board_capture_monitor(
+                    x1,
+                    y1,
+                    dx,
+                    dy,
+                    full_monitor,
+                )
+                continue
+
+            if initial_result is None:
+                print("收到停止指令，程序结束。")
+                return
+
+            _, capture_x1, capture_y1, dx, dy = initial_result
+            x1 = capture_x1 + monitor["left"]
+            y1 = capture_y1 + monitor["top"]
+
+            print("初始棋盘已稳定，开始截图...")
+            break
 
 
     run_auto_loop(
@@ -4233,4 +4368,5 @@ if __name__ == "__main__":
         input("按 Enter 退出...")
 
     finally:
+        close_selection_overlay()
         finish_debug_writer()
